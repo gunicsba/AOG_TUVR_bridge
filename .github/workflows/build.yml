@@ -27,7 +27,7 @@ jobs:
       run: |
         $ICON_FLAG = ""
         if (Test-Path "icon.ico") {
-          $ICON_FLAG = "--icon=`"icon.ico`""
+          $ICON_FLAG = "--icon=icon.ico"
           Write-Host "Using icon: icon.ico"
         } else {
           Write-Host "WARNING: icon.ico not found!"
