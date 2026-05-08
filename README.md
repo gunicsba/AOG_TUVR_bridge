@@ -1,3 +1,5 @@
+[![Build AOG-TUVR](https://github.com/gunicsba/AOG_TUVR_bridge/actions/workflows/build.yml/badge.svg)](https://github.com/gunicsba/AOG_TUVR_bridge/actions/workflows/build.yml)
+
 # AOG-TUVR Bridge
 
 Bridge between **AgOpenGPS** and the **Trimble TUVR / HC5500** sprayer controller.
