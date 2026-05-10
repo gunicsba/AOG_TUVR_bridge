@@ -16,6 +16,9 @@ Grab the latest `AOG-TUVR.exe` from [Releases](../../releases).
 
 - RS-232 connection to the HC5500 (USB-to-RS232 adapter + null modem cable)
 - AgOpenGPS / AgIO broadcasting on UDP port 8888
+- [RS-232 adapter](https://www.aliexpress.com/item/1005009141854353.html)
+- AgOpenGPS / AgIO broadcasting on UDP port 8888
+
 
 For development:
 - Python 3.8+
@@ -27,6 +30,14 @@ Run `AOG-TUVR.exe`. On first run you will be prompted to select a COM port.
 The choice is saved to `config.ini` so subsequent runs connect automatically.
 
 Press **X** to exit.
+
+## Connection
+![nullmodemkabel.jpg](nullmodemkabel.jpg "Null Modem cable")
+
+Make your own cable as pin4 has 12V on Hardi and your USB-RS232 adapter might not like it!
+Look for RS232 / DB9 connector.
+
+![HARDI_HC5500_COM2.png](HARDI_HC5500_COM2.png "HC5500 connector")
 
 ## How It Works
 
