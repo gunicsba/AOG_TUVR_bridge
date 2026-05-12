@@ -1,39 +1,59 @@
-import serial
-import serial.tools.list_ports
+"""AgOpenGPS <-> TUVR variable-rate controller bridge.
+
+Reads section / speed PGNs from AgIO over UDP, drives a binary serial link
+to a TUVR-speaking controller at 38400 8-N-1, and feeds the controller's
+section state back into AgIO so the rate controller UI mirrors reality.
+"""
+import logging
+import msvcrt
+import os
 import socket
+import sys
 import threading
 import time
-import msvcrt
-import logging
-import os
-import sys
 from configparser import ConfigParser
-from typing import Optional, Tuple
+from enum import Enum, auto
+from typing import List, Optional
+
+import serial
+import serial.tools.list_ports
+
+from tuvr_protocol import (
+    FUNCTION,
+    SECTION_COUNT_CHANGE,
+    StreamParser,
+    build_gps_speed_cmd,
+    build_section_state_cmd,
+    build_section_state_req,
+    build_status_req,
+    unpack_section_bits,
+)
 
 # ---------------------------------------------------------------------------
-#  HC5500 packet framing constants
+#  Serial / protocol constants
 # ---------------------------------------------------------------------------
-SOH = 0x01
-STX = 0x02
-ETX = 0x03
-EOT = 0x04
+BAUD = 38400
+DEFAULT_SECTION_COUNT = 8
 
 # ---------------------------------------------------------------------------
-#  Timing / protocol constants
+#  Timing
 # ---------------------------------------------------------------------------
-BAUD = 9600
-BOOT_PERIOD_S = 1.0
-RUN_PERIOD_S = 0.2
-REQUEST_GAP_S = 0.05
-SECTION_COUNT = 13
-HC_TIMEOUT_S = 1
+DEFAULT_SCT_HZ = 5             # SECTION_STATE_CMD rate
+DEFAULT_SPD_HZ = 5             # GPS_SPEED_CMD rate
+DEFAULT_STATUS_HZ = 1          # STATUS_REQ rate
 
+MACHINE_TIMEOUT_S = 5.0        # No valid controller packet -> DISCONNECTED
+SPEED_VALIDITY_WINDOW_S = 3.0  # Speed source=1 only if AgIO spoke within this
+
+TICK_S = 0.05                   # Periodic loop granularity (50 ms)
+
+# ---------------------------------------------------------------------------
+#  UDP / AgIO
+# ---------------------------------------------------------------------------
 UDP_PORT = 8888
 UDP_TIMEOUT_S = 3
-AOG_PORT = 9999           # AgIO listens on this port for replies
-
-# AgOpenGPS Machine Module identity
-AOG_MACHINE_SRC = 0x7B    # 123 = machine module
+AOG_PORT = 9999
+AOG_MACHINE_SRC = 0x7B          # 123 = machine module
 
 # ---------------------------------------------------------------------------
 #  Logging
@@ -45,26 +65,34 @@ logging.basicConfig(
     format="[%(asctime)s.%(msecs)03d] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("hc5500")
+logger = logging.getLogger("tuvr")
+
 
 # ---------------------------------------------------------------------------
 #  Config
 # ---------------------------------------------------------------------------
 def get_app_directory() -> str:
-    """Get the application directory (works for both script and frozen exe)."""
-    if getattr(sys, 'frozen', False):
-        # Running as compiled executable
+    """Return the directory containing the script or frozen exe."""
+    if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    else:
-        # Running as script
-        return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.abspath(__file__))
+
 
 CONFIG_PATH = os.path.join(get_app_directory(), "config.ini")
+
 
 def load_config() -> ConfigParser:
     config = ConfigParser()
     if not os.path.exists(CONFIG_PATH):
-        config["main"] = {"com": "0", "comms_lost_zero": "1"}
+        config["main"] = {
+            "com": "0",
+            "comms_lost_zero": "1",
+            "sections": str(DEFAULT_SECTION_COUNT),
+            "sct_hz": str(DEFAULT_SCT_HZ),
+            "spd_hz": str(DEFAULT_SPD_HZ),
+            "status_hz": str(DEFAULT_STATUS_HZ),
+            "subnet": "255.255.255.255",
+        }
         with open(CONFIG_PATH, "w") as f:
             config.write(f)
     else:
@@ -72,100 +100,23 @@ def load_config() -> ConfigParser:
     return config
 
 
-def save_config(config: ConfigParser):
+def save_config(config: ConfigParser) -> None:
     with open(CONFIG_PATH, "w") as f:
         config.write(f)
 
 
-# ===================================================================
-#  HC5500 packet building / parsing  (unchanged from working DEMO)
-# ===================================================================
-
-def xor_checksum_ascii(header: str, payload: str) -> str:
-    x = 0
-    for ch in (header + payload):
-        x ^= ord(ch)
-    return f"{x:02X}"
+# ===========================================================================
+#  Serial-level state machine
+# ===========================================================================
+class MachineState(Enum):
+    DISCONNECTED = auto()   # No controller reply yet / timed out.
+    READY = auto()          # Controller is alive; waiting for AgIO.
+    RUNNING = auto()        # READY + AgIO connected.
 
 
-def build_packet(header: str, payload: str) -> bytes:
-    checksum = xor_checksum_ascii(header, payload)
-    return (
-        bytes([SOH])
-        + header.encode("ascii")
-        + bytes([STX])
-        + payload.encode("ascii")
-        + bytes([ETX])
-        + checksum.encode("ascii")
-        + bytes([EOT])
-    )
-
-
-def parse_packet(data: bytes) -> Optional[Tuple[str, str, str, str, bool]]:
-    try:
-        if len(data) < 8:
-            return None
-        if data[0] != SOH or data[-1] != EOT:
-            return None
-
-        stx_i = data.index(bytes([STX]))
-        etx_i = data.index(bytes([ETX]))
-
-        header = data[1:stx_i].decode("ascii", errors="replace")
-        payload = data[stx_i + 1:etx_i].decode("ascii", errors="replace")
-        checksum = data[etx_i + 1:etx_i + 3].decode("ascii", errors="replace")
-        calc = xor_checksum_ascii(header, payload)
-        valid = checksum.upper() == calc.upper()
-
-        return header, payload, checksum, calc, valid
-    except Exception:
-        return None
-
-
-class PacketStreamParser:
-    def __init__(self):
-        self.buf = bytearray()
-
-    def feed(self, chunk: bytes):
-        self.buf.extend(chunk)
-        items = []
-
-        while True:
-            try:
-                start = self.buf.index(SOH)
-            except ValueError:
-                if len(self.buf) > 4096:
-                    self.buf.clear()
-                break
-
-            if start > 0:
-                garbage = bytes(self.buf[:start])
-                items.append(("garbage", garbage))
-                del self.buf[:start]
-
-            try:
-                end = self.buf.index(EOT, 1)
-            except ValueError:
-                break
-
-            pkt = bytes(self.buf[:end + 1])
-            del self.buf[:end + 1]
-            items.append(("packet", pkt))
-
-        return items
-
-
-def hex_dump(data: bytes) -> str:
-    return data.hex(" ").upper()
-
-
-def ascii_dump(data: bytes) -> str:
-    return "".join(chr(b) if 32 <= b <= 126 else "." for b in data)
-
-
-# ===================================================================
-#  AgOpenGPS message helpers
-# ===================================================================
+# ===========================================================================
+#  AgOpenGPS helpers
+# ===========================================================================
 
 def aog_checksum(msg: bytes) -> int:
     """Sum bytes 2..n-1 (everything between preamble and CRC slot)."""
@@ -173,14 +124,12 @@ def aog_checksum(msg: bytes) -> int:
 
 
 def build_hello_reply(relay_lo: int, relay_hi: int) -> bytes:
-    """Build the Hello reply that makes the machine icon go green in AOG.
-    Format: 0x80 0x81 src=0x7B pgn=0x7B len=5 relayLo relayHi 0 0 0 CRC
-    """
+    """Build the Hello reply that makes the machine icon go green in AOG."""
     msg = bytearray([
         0x80, 0x81,
-        AOG_MACHINE_SRC,   # src  = 123
-        AOG_MACHINE_SRC,   # pgn  = 123
-        5,                 # len  = 5 data bytes
+        AOG_MACHINE_SRC,
+        AOG_MACHINE_SRC,
+        5,
         relay_lo & 0xFF,
         relay_hi & 0xFF,
         0, 0, 0,
@@ -190,26 +139,70 @@ def build_hello_reply(relay_lo: int, relay_hi: int) -> bytes:
 
 
 def build_from_machine(relay_lo: int, relay_hi: int) -> bytes:
-    """Build the 'From Machine' PGN 0xED sent every 200ms.
-    Format: 0x80 0x81 src=0x7B pgn=0xED len=8 data[8] CRC
-    """
+    """Build the 'From Machine' PGN 0xED."""
     msg = bytearray([
         0x80, 0x81,
-        AOG_MACHINE_SRC,   # src = 123
-        0xED,              # pgn = 237 (From Machine)
-        8,                 # len = 8 data bytes
-        relay_lo & 0xFF,   # byte 5: relayLo
-        relay_hi & 0xFF,   # byte 6: relayHi
-        0, 0,              # bytes 7-8: reserved
-        0, 0, 0, 0,        # bytes 9-12: reserved
+        AOG_MACHINE_SRC,
+        0xED,
+        8,
+        relay_lo & 0xFF,
+        relay_hi & 0xFF,
+        0, 0,
+        0, 0, 0, 0,
     ])
     msg.append(aog_checksum(msg))
     return bytes(msg)
 
 
-# ===================================================================
+def build_section_data(main_sw_bits: int, relay_lo: int, relay_hi: int,
+                       off_lo: int = 0, off_hi: int = 0) -> bytes:
+    """PGN 0xEA (234) -- Section Control Data back to AgIO."""
+    msg = bytearray([
+        0x80, 0x81,
+        AOG_MACHINE_SRC,
+        0xEA,
+        8,
+        main_sw_bits & 0xFF,
+        0, 0, 0,
+        relay_lo & 0xFF,
+        off_lo & 0xFF,
+        relay_hi & 0xFF,
+        off_hi & 0xFF,
+    ])
+    msg.append(aog_checksum(msg))
+    return bytes(msg)
+
+
+def _crc8(data: bytes, length: int) -> int:
+    return sum(data[:length]) & 0xFF
+
+
+def build_switch_pgn(auto_on: bool, master_on: bool,
+                     sw_lo: int, sw_hi: int) -> bytes:
+    """PGN 32618 -- switch-box feedback to Rate Controller."""
+    flags = 0
+    if auto_on:
+        flags |= 0x01
+    if master_on:
+        flags |= 0x02
+    else:
+        flags |= 0x04
+
+    msg = bytearray([
+        106,
+        127,
+        flags,
+        sw_lo & 0xFF,
+        sw_hi & 0xFF,
+        0,
+    ])
+    msg[5] = _crc8(msg, 5)
+    return bytes(msg)
+
+
+# ===========================================================================
 #  COM port selection
-# ===================================================================
+# ===========================================================================
 
 def list_ports():
     ports = list(serial.tools.list_ports.comports())
@@ -242,228 +235,274 @@ def select_port() -> Optional[str]:
         print("Invalid choice.")
 
 
-# ===================================================================
-#  HCRequester  -- manages HC5500 serial communication
-# ===================================================================
+# ===========================================================================
+#  TUVRRequester -- serial-side state machine + scheduler
+# ===========================================================================
 
-class HCRequester:
-    def __init__(self, ser: serial.Serial):
+class TUVRRequester:
+    def __init__(self, ser: serial.Serial, section_count: int,
+                 sct_hz: int, spd_hz: int, status_hz: int,
+                 config: ConfigParser) -> None:
         self.ser = ser
-        self.lock = threading.Lock()           # serial write lock
-        self.sections_lock = threading.Lock()   # protects target_sections
+        self.config = config
+        self.lock = threading.Lock()            # serial write lock
+        self.sections_lock = threading.Lock()   # target_sections / speed
         self.running = True
 
-        # HC5500 connection state
-        self.boot_mode = True
-        self.last_valid_hc_time = 0.0
+        # Connection state
+        self.state = MachineState.DISCONNECTED
+        self.last_valid_machine_time = 0.0
 
-        # Section state (written by UDP thread, read by TX thread)
-        self.target_sections = [0] * SECTION_COUNT
-        self.last_hc_s6c = None
-        self.last_hc_a6b = None
+        # Configured limits
+        self.section_count = max(1, min(16, section_count))
 
-        # AgIO connection flag
+        # Section state
+        self.target_sections = [0] * self.section_count          # from AOG
+        self.machine_sections: Optional[List[int]] = None         # last from controller
+
+        # Speed (km/h) from AOG
+        self.current_speed_kmh = 0.0
+        self.last_aog_speed_time = 0.0
+
+        # AgIO connection
         self.agio_connected = False
 
-        # Current relay bytes (for AOG Hello reply / From Machine PGN)
+        # Relay bytes for PGNs back to AOG
         self.relay_lo = 0
         self.relay_hi = 0
+        self.off_lo = 0
+        self.off_hi = 0
+        self.main_sw_bits = 0
+        self.is_auto_mode = True       # always-auto in V1
+        self.switch_pgn_pending: Optional[bytes] = None
+        self._last_sw_pgn: Optional[bytes] = None
 
-    # ---- serial helpers ----
+        # Periodic timers
+        self.sct_hz = max(1, sct_hz)
+        self.spd_hz = max(1, spd_hz)
+        self.status_hz = max(1, status_hz)
+        self.last_status_time = 0.0
+        self.last_sct_time = 0.0
+        self.last_spd_time = 0.0
 
-    def send_packet(self, header: str, payload: str):
-        pkt = build_packet(header, payload)
+    # ------------------------------------------------------------------
+    #  Serial write helpers
+    # ------------------------------------------------------------------
+    def _send(self, packet: bytes, label: str) -> None:
         with self.lock:
-            self.ser.write(pkt)
+            self.ser.write(packet)
             self.ser.flush()
-        logger.debug(f"TX {header} | {payload} | HEX={hex_dump(pkt)}")
+        logger.info(f"TX >> {label} [{packet.hex()}]")
 
-    # ---- boot / run state machine ----
+    # ------------------------------------------------------------------
+    #  State transitions
+    # ------------------------------------------------------------------
+    def enter_disconnected(self, reason: str) -> None:
+        if self.state != MachineState.DISCONNECTED:
+            logger.info(f"STATE -> DISCONNECTED ({reason})")
+        self.state = MachineState.DISCONNECTED
+        self.machine_sections = None
 
-    def enter_boot_mode(self, reason: str):
-        if not self.boot_mode:
-            logger.info(f"STATE -> BOOT ({reason})")
-        self.boot_mode = True
+    def enter_ready(self, reason: str) -> None:
+        if self.state != MachineState.READY:
+            logger.info(f"STATE -> READY ({reason})")
+        self.state = MachineState.READY
 
-    def enter_run_mode(self, reason: str):
-        if self.boot_mode:
-            logger.info(f"STATE -> RUN ({reason})")
-        self.boot_mode = False
+    def enter_running(self, reason: str) -> None:
+        if self.state != MachineState.RUNNING:
+            logger.info(f"STATE -> RUNNING ({reason})")
+        self.state = MachineState.RUNNING
+        # Fire SCT/SPD immediately on entering RUNNING.
+        self.last_sct_time = 0.0
+        self.last_spd_time = 0.0
 
-    def send_boot_request(self):
-        self.send_packet("R0D", "6A")
-
-    def send_run_cycle(self):
-        with self.sections_lock:
-            sec = ",".join(str(x) for x in self.target_sections)
-
-        self.send_packet("S0C", f"6C,{sec}")
-        time.sleep(REQUEST_GAP_S)
-
-        self.send_packet("R0D", "6B")
-        time.sleep(REQUEST_GAP_S)
-
-        self.send_packet("R0D", "6D")
-
-    def periodic_loop(self):
+    # ------------------------------------------------------------------
+    #  Periodic scheduler
+    # ------------------------------------------------------------------
+    def periodic_loop(self) -> None:
         while self.running:
             now = time.time()
 
-            if self.last_valid_hc_time > 0 and (now - self.last_valid_hc_time) > HC_TIMEOUT_S:
-                self.enter_boot_mode(f"HC timeout {now - self.last_valid_hc_time:.2f}s")
+            # --- timeout check ---
+            if self.state != MachineState.DISCONNECTED:
+                if self.last_valid_machine_time > 0 and \
+                   (now - self.last_valid_machine_time) > MACHINE_TIMEOUT_S:
+                    self.enter_disconnected(
+                        f"machine timeout "
+                        f"{now - self.last_valid_machine_time:.1f}s")
 
-            start = time.time()
+            # READY -> RUNNING when AgIO connects
+            if self.state == MachineState.READY and self.agio_connected:
+                self.enter_running("AgIO connected")
 
-            if self.boot_mode:
-                self.send_boot_request()
-                period = BOOT_PERIOD_S
-            else:
-                self.send_run_cycle()
-                period = RUN_PERIOD_S
+            # --- STATUS_REQ heartbeat (all states; acts as probe when DISCONNECTED) ---
+            if (now - self.last_status_time) >= (1.0 / self.status_hz):
+                self._send(build_status_req(), "STATUS_REQ")
+                self.last_status_time = now
 
-            elapsed = time.time() - start
-            sleep_left = period - elapsed
-            if sleep_left > 0:
-                time.sleep(sleep_left)
+            # --- RUNNING-only sends ---
+            if self.state == MachineState.RUNNING:
+                if (now - self.last_sct_time) >= (1.0 / self.sct_hz):
+                    with self.sections_lock:
+                        bits = [bool(s) for s in self.target_sections]
+                    n = self.section_count
+                    if len(bits) < n:
+                        bits = bits + [False] * (n - len(bits))
+                    else:
+                        bits = bits[:n]
+                    self._send(build_section_state_cmd(bits),
+                               f"SECTION_STATE_CMD {_bits_to_str(bits)}")
+                    self.last_sct_time = now
 
-    # ---- section update from AgOpenGPS ----
+                if (now - self.last_spd_time) >= (1.0 / self.spd_hz):
+                    with self.sections_lock:
+                        spd_kmh = self.current_speed_kmh
+                        last_spd = self.last_aog_speed_time
+                    mm_per_s = int(round(spd_kmh * 1000.0 / 3.6))
+                    source = 1 if (now - last_spd) < SPEED_VALIDITY_WINDOW_S else 0
+                    self._send(
+                        build_gps_speed_cmd(mm_per_s, source),
+                        f"GPS_SPEED_CMD {spd_kmh:.1f}km/h "
+                        f"({mm_per_s}mm/s src={source})")
+                    self.last_spd_time = now
 
-    def update_sections_from_aog(self, section_bits: int):
-        """Map AgOpenGPS 8-bit section mask to HC5500 13-element array."""
-        new_sections = [0] * SECTION_COUNT
-        for i in range(8):
+            time.sleep(TICK_S)
+
+    # ------------------------------------------------------------------
+    #  Updates from AgOpenGPS
+    # ------------------------------------------------------------------
+    def update_sections_from_aog(self, section_bits: int) -> None:
+        new_sections = [0] * self.section_count
+        for i in range(min(8, self.section_count)):
             new_sections[i] = 1 if (section_bits >> i) & 1 else 0
+
+        changed = False
         with self.sections_lock:
+            if new_sections != self.target_sections:
+                changed = True
             self.target_sections = new_sections
-            self.relay_lo = section_bits & 0xFF
 
-    # ---- HC5500 response parsing ----
-
-    def parse_section_list(self, payload: str, record_id: str):
-        parts = payload.split(",")
-        if not parts or parts[0] != record_id:
-            return None
-
-        values = []
-        for p in parts[1:1 + SECTION_COUNT]:
-            try:
-                values.append(int(p))
-            except ValueError:
-                return None
-
-        if len(values) != SECTION_COUNT:
-            return None
-
-        return values
-
-    def handle_valid_hc_packet(self, header: str, payload: str):
-        self.last_valid_hc_time = time.time()
-        self.enter_run_mode(f"valid HC packet {header}")
-
-        first = payload.split(",", 1)[0] if payload else ""
-
-        if header == "A0D" and first == "6A":
-            logger.info(f"HC 6A config: {payload}")
-
-        elif header == "A0D" and first == "69":
-            try:
-                scaled = float(payload.split(",")[1])
-                hc_rate = scaled * 10000.0
-                logger.debug(f"HC 69 target rate = {hc_rate:.1f} l/ha")
-            except Exception:
-                logger.info(f"HC 69 unexpected payload: {payload}")
-
-        elif header == "S0C" and first == "68":
-            try:
-                scaled = float(payload.split(",")[1])
-                logger.debug(f"HC S68 set/report rate = {scaled * 10000:.1f} l/ha")
-            except Exception:
-                logger.info(f"HC S68 unexpected payload: {payload}")
-
-        elif header == "S0C" and first == "6C":
-            values = self.parse_section_list(payload, "6C")
-            if values is None:
-                logger.info(f"HC S6C unexpected payload: {payload}")
+        # Send immediately on change so the controller reacts without waiting.
+        if changed and self.state == MachineState.RUNNING:
+            n = self.section_count
+            bits = [bool(s) for s in new_sections]
+            if len(bits) < n:
+                bits = bits + [False] * (n - len(bits))
             else:
-                if values != self.last_hc_s6c:
-                    self.last_hc_s6c = values
-                    logger.info(f"HC S6C section state = {values}")
-                else:
-                    logger.debug(f"HC S6C section state unchanged = {values}")
+                bits = bits[:n]
+            self._send(build_section_state_cmd(bits),
+                       f"SECTION_STATE_CMD (change) {_bits_to_str(bits)}")
 
-        elif header == "A0D" and first == "6B":
-            values = self.parse_section_list(payload[:-2] if payload.endswith(",A") else payload, "6B")
-            self.last_hc_a6b = payload
-            logger.debug(f"HC A6B desired sections = {payload}")
+    def update_speed_from_aog(self, speed_kmh: float) -> None:
+        with self.sections_lock:
+            self.current_speed_kmh = speed_kmh
+            self.last_aog_speed_time = time.time()
 
-        elif header == "A0D" and first == "6D":
-            logger.debug(f"HC 6D mode = {payload}")
+    # ------------------------------------------------------------------
+    #  Incoming packet dispatch
+    # ------------------------------------------------------------------
+    def handle_packet(self, id_byte: int, function: int,
+                      payload: bytes) -> None:
+        """Called by the receiver thread for every validated frame."""
+        self.last_valid_machine_time = time.time()
 
-        elif header == "V0C" and first == "68":
-            try:
-                scaled = float(payload.split(",")[1])
-                logger.debug(f"HC V68 rate value = {scaled * 10000:.1f} l/ha")
-            except Exception:
-                logger.info(f"HC V68 unexpected payload: {payload}")
+        # First valid frame in any state brings us up to READY.
+        if self.state == MachineState.DISCONNECTED:
+            self.enter_ready("first valid frame")
 
-        elif header == "N0C" and first == "6C":
-            values = self.parse_section_list(payload, "6C")
-            logger.debug(f"HC N6C actual sections = {values if values is not None else payload}")
-
+        if function == FUNCTION.STATUS:
+            logger.debug(f"STATUS reply [{payload.hex()}]")
+        elif function == FUNCTION.SECTION_STATE:
+            self._on_section_state(payload)
+        elif function == FUNCTION.GPS_SPEED:
+            logger.debug(f"GPS_SPEED echo [{payload.hex()}]")
         else:
-            logger.info(f"HC OTHER {header} | {payload}")
+            logger.info(
+                f"RX unhandled function 0x{function:02X} [{payload.hex()}]")
+
+    # ---- SECTION_STATE handler ----
+    def _on_section_state(self, payload: bytes) -> None:
+        try:
+            count, bits = unpack_section_bits(payload)
+        except ValueError as e:
+            logger.warning(f"SECTION_STATE parse error: {e}")
+            return
+
+        if count == SECTION_COUNT_CHANGE:
+            logger.debug("SECTION_STATE data-change sentinel received")
+            return
+
+        if count != self.section_count:
+            logger.info(
+                f"SECTION_STATE count {count} != "
+                f"configured {self.section_count}")
+
+        # Fit the bridge's configured section_count for AOG bitmask purposes.
+        cur = [1 if (i < len(bits) and bits[i]) else 0
+               for i in range(self.section_count)]
+        if cur != self.machine_sections:
+            self.machine_sections = cur
+            logger.info(f"Controller sections = {cur}")
+
+        # Update relay/off masks for AgOpenGPS feedback PGNs.
+        relay = 0
+        off = 0
+        for i, on in enumerate(cur):
+            if on:
+                relay |= (1 << i)
+            else:
+                off |= (1 << i)
+        self.relay_lo = relay & 0xFF
+        self.relay_hi = (relay >> 8) & 0xFF
+        self.off_lo = off & 0xFF
+        self.off_hi = (off >> 8) & 0xFF
+
+        # V1: always-auto, always-master-on feedback to AOG.
+        new_sw_pgn = build_switch_pgn(True, True, self.relay_lo, self.relay_hi)
+        if new_sw_pgn != self._last_sw_pgn:
+            self._last_sw_pgn = new_sw_pgn
+            self.switch_pgn_pending = new_sw_pgn
 
 
-# ===================================================================
+def _bits_to_str(bits: List[bool]) -> str:
+    return "".join("1" if b else "0" for b in bits)
+
+
+# ===========================================================================
 #  Thread functions
-# ===================================================================
+# ===========================================================================
 
-def receiver_loop(ser: serial.Serial, parser: PacketStreamParser, req: HCRequester):
-    """Thread: reads serial data from HC5500, parses packets."""
+def receiver_loop(ser: serial.Serial, parser: StreamParser,
+                  req: TUVRRequester) -> None:
+    """Reads serial bytes, hands validated frames to the requester."""
     while req.running:
         try:
             data = ser.read(256)
             if not data:
                 continue
 
-            logger.debug(f"RAW HEX   {hex_dump(data)}")
-            logger.debug(f"RAW ASCII {ascii_dump(data)}")
-
-            for kind, blob in parser.feed(data):
-                if kind == "garbage":
-                    if blob:
-                        logger.debug(f"GARBAGE HEX   {hex_dump(blob)}")
-                        logger.debug(f"GARBAGE ASCII {ascii_dump(blob)}")
-                    continue
-
-                parsed = parse_packet(blob)
-                if parsed is None:
-                    logger.info(f"BADFRAME HEX   {hex_dump(blob)}")
-                    logger.info(f"BADFRAME ASCII {ascii_dump(blob)}")
-                    continue
-
-                header, payload, checksum, calc, valid = parsed
-                logger.debug(f"PKT valid={valid} cs={checksum} calc={calc} {header} | {payload}")
-
-                if valid:
-                    req.handle_valid_hc_packet(header, payload)
+            for id_byte, function, payload in parser.feed(data):
+                logger.info(
+                    f"RX << id=0x{id_byte:02X} "
+                    f"fn=0x{function:02X} [{payload.hex()}]")
+                req.handle_packet(id_byte, function, payload)
 
         except Exception as e:
             logger.info(f"RX error: {e}")
             time.sleep(0.2)
 
 
-def udp_listener_loop(req: HCRequester, comms_lost_zero: bool):
-    """Thread: receives AgOpenGPS PGNs via UDP, updates shared section state,
-    and sends Hello reply + From Machine PGN back to AgIO."""
+def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
+                      subnet: str) -> None:
+    """Receives AgOpenGPS PGNs and sends feedback PGNs back."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.bind(("", UDP_PORT))
     sock.settimeout(UDP_TIMEOUT_S)
     logger.info(f"UDP listening on port {UDP_PORT}")
 
-    # Broadcast address for replies to AgIO
-    broadcast = ("255.255.255.255", AOG_PORT)
+    broadcast = (subnet, AOG_PORT)
+    logger.info(f"UDP broadcast -> {broadcast}")
 
     while req.running:
         try:
@@ -474,6 +513,9 @@ def udp_listener_loop(req: HCRequester, comms_lost_zero: bool):
                 req.agio_connected = False
                 if comms_lost_zero:
                     req.update_sections_from_aog(0x00)
+                    req.update_speed_from_aog(0.0)
+                if req.state == MachineState.RUNNING:
+                    req.enter_ready("AgIO timeout")
             continue
         except OSError:
             if not req.running:
@@ -482,8 +524,6 @@ def udp_listener_loop(req: HCRequester, comms_lost_zero: bool):
 
         if len(data) < 5:
             continue
-
-        # Verify AOG preamble
         if data[0] != 0x80 or data[1] != 0x81:
             continue
 
@@ -495,35 +535,53 @@ def udp_listener_loop(req: HCRequester, comms_lost_zero: bool):
                 logger.info(f"AgIO connected (version {version / 10:.1f})")
             req.agio_connected = True
 
-            # Only reply when HC5500 is alive (run mode) -- keeps icon red until connected
-            if not req.boot_mode:
+            if req.state in (MachineState.READY, MachineState.RUNNING):
                 reply = build_hello_reply(req.relay_lo, req.relay_hi)
                 sock.sendto(reply, broadcast)
-                logger.debug(f"TX Hello reply -> {broadcast}")
+                logger.debug(
+                    f"TX Hello reply -> {broadcast} [{reply.hex()}]")
             else:
-                logger.debug("AgIO Hello ignored -- HC5500 not connected (boot mode)")
+                logger.debug("AgIO Hello ignored -- controller not ready")
 
         elif pgn == 0xEF:  # Machine Data -- section bits
             if len(data) > 12:
                 section_bits = data[11]
                 req.update_sections_from_aog(section_bits)
-                logger.debug(f"AgIO sections byte=0x{section_bits:02X} -> {req.target_sections[:8]}")
 
-                # Only send From Machine when HC5500 is alive
-                if not req.boot_mode:
-                    from_machine = build_from_machine(req.relay_lo, req.relay_hi)
+                if req.state == MachineState.RUNNING:
+                    if req.is_auto_mode:
+                        ea_relay_lo, ea_relay_hi = 0, 0
+                    else:
+                        ea_relay_lo = req.relay_lo
+                        ea_relay_hi = req.relay_hi
+                    sect_data = build_section_data(
+                        req.main_sw_bits,
+                        ea_relay_lo, ea_relay_hi,
+                        req.off_lo, req.off_hi)
+                    sock.sendto(sect_data, broadcast)
+                    req.main_sw_bits = 0
+
+                    from_machine = build_from_machine(
+                        req.relay_lo, req.relay_hi)
                     sock.sendto(from_machine, broadcast)
 
-        elif pgn == 0xFE:  # Steer Data -- speed (log only, not used)
+                    sw_pgn = req.switch_pgn_pending
+                    if sw_pgn is not None:
+                        sock.sendto(sw_pgn, broadcast)
+                        req.switch_pgn_pending = None
+                        logger.info(
+                            f"TX SwitchPGN -> {broadcast} [{sw_pgn.hex()}]")
+
+        elif pgn == 0xFE:  # Steer Data -- speed + section bits
             if len(data) > 6:
                 spd = int.from_bytes(data[5:7], "little", signed=False) * 0.1
-                logger.debug(f"AgIO speed={spd:.1f} km/h")
+                req.update_speed_from_aog(spd)
+            if len(data) > 12:
+                section_bits = data[11]
+                req.update_sections_from_aog(section_bits)
 
-        # 0x64, 0xEB, others: silently ignored
 
-
-def keyboard_loop(req: HCRequester):
-    """Thread: keyboard input. X = exit."""
+def keyboard_loop(req: TUVRRequester) -> None:
     logger.info("Keyboard: X = exit")
     while req.running:
         if msvcrt.kbhit():
@@ -535,20 +593,29 @@ def keyboard_loop(req: HCRequester):
         time.sleep(0.05)
 
 
-# ===================================================================
+# ===========================================================================
 #  Main
-# ===================================================================
+# ===========================================================================
 
-def main():
-    print("AOG-TUVR Bridge  (AgOpenGPS -> HC5500 section control)")
+def main() -> None:
+    print("AOG-TUVR Bridge  (AgOpenGPS <-> TUVR VR controller)")
     print()
 
-    # --- config ---
     config = load_config()
     saved_com = config.get("main", "com", fallback="0")
     comms_lost_zero = config.getboolean("main", "comms_lost_zero", fallback=True)
+    section_count = config.getint("main", "sections",
+                                   fallback=DEFAULT_SECTION_COUNT)
+    sct_hz = config.getint("main", "sct_hz", fallback=DEFAULT_SCT_HZ)
+    spd_hz = config.getint("main", "spd_hz", fallback=DEFAULT_SPD_HZ)
+    status_hz = config.getint("main", "status_hz", fallback=DEFAULT_STATUS_HZ)
+    subnet = config.get("main", "subnet", fallback="255.255.255.255")
 
-    # --- COM port selection ---
+    print(f"Config: sections={section_count}  SCT={sct_hz}Hz  "
+          f"SPD={spd_hz}Hz  STATUS={status_hz}Hz  "
+          f"comms_lost_zero={comms_lost_zero}  subnet={subnet}")
+    print()
+
     available = {p.device for p in serial.tools.list_ports.comports()}
     if saved_com != "0" and saved_com in available:
         print(f"Using saved COM port: {saved_com}")
@@ -570,16 +637,19 @@ def main():
         bytesize=serial.EIGHTBITS,
         parity=serial.PARITY_NONE,
         stopbits=serial.STOPBITS_ONE,
-        timeout=0.02,
+        timeout=0.05,
     )
 
-    parser = PacketStreamParser()
-    requester = HCRequester(ser)
+    parser = StreamParser()
+    requester = TUVRRequester(ser, section_count, sct_hz, spd_hz,
+                              status_hz, config)
 
-    # --- start threads ---
     threads = [
-        threading.Thread(target=udp_listener_loop, args=(requester, comms_lost_zero), daemon=True),
-        threading.Thread(target=receiver_loop, args=(ser, parser, requester), daemon=True),
+        threading.Thread(target=udp_listener_loop,
+                         args=(requester, comms_lost_zero, subnet),
+                         daemon=True),
+        threading.Thread(target=receiver_loop,
+                         args=(ser, parser, requester), daemon=True),
         threading.Thread(target=requester.periodic_loop, daemon=True),
         threading.Thread(target=keyboard_loop, args=(requester,), daemon=True),
     ]

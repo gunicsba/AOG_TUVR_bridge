@@ -1,110 +1,154 @@
-[![Build AOG-TUVR](https://github.com/gunicsba/AOG_TUVR_bridge/actions/workflows/build.yml/badge.svg)](https://github.com/gunicsba/AOG_TUVR_bridge/actions/workflows/build.yml)
+# AOG_TUVR_bridge
 
-# AOG-TUVR Bridge
+AgOpenGPS <-> TUVR variable-rate controller bridge.
 
-Bridge between **AgOpenGPS** and the **Trimble TUVR / HC5500** sprayer controller.
+Reads section and speed PGNs from AgIO over UDP, drives a binary serial
+link to a TUVR-speaking rate controller at 38400 8-N-1, and feeds the
+controller's reported section state back into AgIO so the rate
+controller UI mirrors reality.
 
-AgOpenGPS sends section states via UDP. This bridge translates them into
-HC5500 serial commands (`S0C/6C`) so the controller opens and closes sections
-in real time.
+## What it does
 
-## Download
+- Listens on UDP port `8888` for AgOpenGPS PGNs (`0xC8` Hello, `0xEF`
+  Machine Data, `0xFE` Steer Data).
+- Broadcasts feedback PGNs back (`0xEA` Section Data, `0xED` From
+  Machine, Hello reply, switch-box PGN `32618`).
+- Talks a minimal TSIP-style framed serial protocol to the controller
+  with three wire messages:
+  - `STATUS` (`0x00`) - heartbeat probe, sent at `status_hz`.
+  - `SECTION_STATE` (`0x06`) - bit-packed section command out, echo
+    back in.
+  - `GPS_SPEED` (`0x81`) - speed in mm/s with a validity flag.
+- Also ships a loopback simulator
+  ([tuvr_simulator.py](tuvr_simulator.py)) that pretends to be the
+  controller on the other half of a com0com null-modem pair.
 
-Grab the latest `AOG-TUVR.exe` from [Releases](../../releases).
+## Files
+
+| File | Purpose |
+|---|---|
+| [AOG_TUVR_bridge.py](AOG_TUVR_bridge.py) | The bridge. Threads: UDP listener, serial receiver, periodic scheduler, keyboard. |
+| [tuvr_protocol.py](tuvr_protocol.py) | Framing, checksum, packet builders, `StreamParser`, section bit-packing. |
+| [tuvr_simulator.py](tuvr_simulator.py) | Loopback simulator for hardware-free testing. |
+| [build.bat](build.bat) | PyInstaller one-file build -> `AOG-TUVR.exe`. |
+| [startup.bat](startup.bat) | Convenience launcher. |
+| [config.ini](config.ini) | Auto-created on first run (see below). |
+| [icon.ico](icon.ico) | App icon for the frozen exe. |
 
 ## Requirements
 
-- RS-232 connection to the HC5500 (USB-to-RS232 adapter + null modem cable)
-- AgOpenGPS / AgIO broadcasting on UDP port 8888
-- [RS-232 adapter](https://www.aliexpress.com/item/1005009141854353.html)
-- AgOpenGPS / AgIO broadcasting on UDP port 8888
+- Windows (uses `msvcrt` for keyboard polling).
+- Python 3.8+.
+- `pyserial`.
+- `pyinstaller` (only for building the exe).
 
-
-For development:
-- Python 3.8+
-- [pyserial](https://pypi.org/project/pyserial/) (`pip install pyserial`)
-
-## Usage
-
-Run `AOG-TUVR.exe`. On first run you will be prompted to select a COM port.
-The choice is saved to `config.ini` so subsequent runs connect automatically.
-
-Press **X** to exit.
-
-## Connection
-![nullmodemkabel.jpg](nullmodemkabel.jpg "Null Modem cable")
-
-Make your own cable as pin4 has 12V on Hardi and your USB-RS232 adapter might not like it!
-Look for RS232 / DB9 connector.
-
-![HARDI_HC5500_COM2.png](HARDI_HC5500_COM2.png "HC5500 connector")
-
-## How It Works
+Install:
 
 ```
-AgOpenGPS (AgIO)  UDP:8888        Keyboard (X=exit)
-       |                                |
-       v                                v
- [UDP listener]                  [keyboard thread]
-       |                                |
-       +------> shared state <----------+
-               sections[13]
-               agio_connected
-                    |
-                    v
-          [HC5500 serial threads]
-          TX: boot/run cycle every 0.2s
-          RX: parse HC5500 responses
-                    |
-                    v
-             HC5500 via RS-232
+pip install pyserial pyinstaller
 ```
 
-## AgOpenGPS PGNs
+## Running from source
 
-| PGN byte | Name | Direction | What the bridge does |
-|----------|------|-----------|----------------------|
-| `0xC8` | AgIO Hello | IN | Replies with Hello Machine PGN so the machine icon turns green |
-| `0xEF` | Machine Data | IN | Byte 11 = 8-bit section mask, forwarded to HC5500 |
-| `0xFE` | Steer Data | IN | Speed logged (not sent to HC5500) |
-| `0x7B` | Hello Reply | OUT | Sent to AgIO on port 9999 in response to Hello |
-| `0xED` | From Machine | OUT | Sent to AgIO on port 9999 with current relay state |
-
-## HC5500 Serial Protocol
-
-- **Baud:** 9600, 8N1
-- **Framing:** `SOH HEADER STX PAYLOAD ETX CHECKSUM EOT`
-- **Checksum:** XOR of ASCII bytes in HEADER + PAYLOAD, 2-char uppercase hex
-
-### Run loop commands (5 Hz)
-
-| Command | Purpose |
-|---------|---------|
-| `S0C 68,<rate>` | Set rate (l/ha / 10000) |
-| `R0D 69` | Read back rate |
-| `S0C 6C,<13 sections>` | Set section states (0/1 each) |
-| `R0D 6B` | Read back section status |
-| `R0D 6D` | Read back mode/status |
-
-Boot mode sends `R0D 6A` at 1 Hz until HC5500 responds.
-
-## config.ini
-
-```ini
-[main]
-com = COM3
-comms_lost_zero = 1
+```
+python AOG_TUVR_bridge.py
 ```
 
-| Key | Description |
-|-----|-------------|
-| `com` | Saved COM port (`0` = prompt on startup) |
-| `comms_lost_zero` | `1` = close all sections when AgIO stops responding (3s timeout) |
+First run picks a COM port interactively and writes `config.ini`
+next to the script. Press `X` in the console window to exit cleanly.
 
-## Building
+## Building the exe
 
-```bat
+```
 build.bat
 ```
 
-Produces `AOG-TUVR.exe` via PyInstaller.
+Produces `AOG-TUVR.exe` in the project root.
+
+## config.ini
+
+Auto-generated on first run. Defaults:
+
+```ini
+[main]
+com = 0
+comms_lost_zero = 1
+sections = 8
+sct_hz = 5
+spd_hz = 5
+status_hz = 1
+subnet = 255.255.255.255
+```
+
+| Key | Meaning |
+|---|---|
+| `com` | Saved COM port (e.g. `COM7`). `0` = ask on startup. |
+| `comms_lost_zero` | On AgIO timeout, force all sections off and speed to zero. |
+| `sections` | Total sections sent in `SECTION_STATE_CMD`. Clamped to 1..16. |
+| `sct_hz` | `SECTION_STATE_CMD` send rate. |
+| `spd_hz` | `GPS_SPEED_CMD` send rate. |
+| `status_hz` | `STATUS_REQ` heartbeat / probe rate. |
+| `subnet` | Broadcast address for AgIO PGNs. |
+
+## Serial settings
+
+`38400` baud, 8-N-1, no flow control. Typically wired as a null-modem
+(crossover) cable between the PC and the controller — see
+[nullmodemkabel.jpg](nullmodemkabel.jpg).
+
+## State machine
+
+- **DISCONNECTED** - no valid controller frame seen, or last one was
+  more than `MACHINE_TIMEOUT_S = 5 s` ago. `STATUS_REQ` still fires at
+  `status_hz` as a probe.
+- **READY** - controller replied at least once and AgIO is not
+  connected yet.
+- **RUNNING** - READY plus AgIO is sending PGNs. `SECTION_STATE_CMD`
+  and `GPS_SPEED_CMD` are streamed at their configured rates.
+
+Any incoming valid frame bumps DISCONNECTED -> READY. AgIO timeout
+drops RUNNING -> READY.
+
+## Testing without hardware
+
+Set up a com0com null-modem pair (e.g. `COM10` <-> `COM11`) and in two
+consoles:
+
+```
+python tuvr_simulator.py --com COM11 --sections 8
+python AOG_TUVR_bridge.py
+```
+
+Pick `COM10` when the bridge asks. Hotkeys in the simulator:
+
+| Key | Action |
+|---|---|
+| `S` | Print current simulated state. |
+| `F` | Flip a random section and emit an unsolicited `SECTION_STATE_RESP`. |
+| `X` | Quit. |
+
+## Wire format (summary)
+
+```
+0x10 0x8E 0xAA  <function>  <payload...>  <ck_lo> <ck_hi>  0x10 0x03
+```
+
+Every byte between the leading `0x10` and the trailing `0x10 0x03` is
+escaped by doubling any `0x10` to `0x10 0x10`; the stream parser
+collapses them back on receive. Checksum is a 16-bit unsigned sum of
+`0xAA + function + payload`, transmitted little-endian.
+
+Only three functions are used on the wire:
+
+| Name | Value | Direction | Payload |
+|---|---|---|---|
+| `STATUS` | `0x00` | req out, reply in | 1-byte `txn_id` (we always send `0xFF`) |
+| `SECTION_STATE` | `0x06` | both ways | empty = read, or `reserved + count(LE16) + bit-packed bits` |
+| `GPS_SPEED` | `0x81` | out | `uint32 mm/s (LE) + 1-byte source` |
+
+Any other function received from the controller is logged and ignored.
+
+## License / legal
+
+This bridge is a clean-room implementation for AgOpenGPS. It does not
+include, redistribute or quote any third-party protocol specification.

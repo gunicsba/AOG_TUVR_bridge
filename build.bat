@@ -17,7 +17,7 @@ if exist "%~dp0icon.ico" (
     set ICON_FLAG=
     echo WARNING: icon.ico not found!
 )
-pyinstaller --onefile --console --name "AOG-TUVR" %ICON_FLAG% "%~dp0AOG_TUVR_bridge.py"
+python -m PyInstaller --noconfirm --onefile --console --name "AOG-TUVR" %ICON_FLAG% "%~dp0AOG_TUVR_bridge.py"
 if exist "%~dp0dist\AOG-TUVR.exe" (
     copy "%~dp0dist\AOG-TUVR.exe" "%~dp0AOG-TUVR.exe" >nul
     echo.

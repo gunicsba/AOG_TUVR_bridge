@@ -6,3 +6,4 @@ dist/
 *.spec
 *.exe
 config.ini
+.qoder/
