@@ -325,7 +325,11 @@ class TUVRRequester:
         self.last_valid_machine_time = 0.0
 
         # Configured limits
-        self.section_count = max(1, min(16, section_count))
+        # Up to 64 sections supported on the controller / PGN 0xF0 side.
+        # AOG itself only carries SC1to8 + SC9to16 in PGN 0xEF/0xFE, so
+        # the first 16 sections are AOG-driven and any additional ones
+        # default to OFF until AOG gains a wider section PGN.
+        self.section_count = max(1, min(64, section_count))
 
         # Section state
         self.target_sections = [0] * self.section_count          # from AOG
@@ -443,8 +447,15 @@ class TUVRRequester:
     #  Updates from AgOpenGPS
     # ------------------------------------------------------------------
     def update_sections_from_aog(self, section_bits: int) -> None:
+        """Apply AOG-commanded section bits.
+
+        ``section_bits`` is up to 64 bits wide; bit ``i`` corresponds to
+        section ``i+1``.  Sources today:
+          * PGN 0xEF / 0xFE -> 16-bit (SC1to8 + SC9to16)
+          * PGN 0xE5       -> full 64-bit (8 bytes, LSB-first per byte)
+        """
         new_sections = [0] * self.section_count
-        for i in range(min(8, self.section_count)):
+        for i in range(min(64, self.section_count)):
             new_sections[i] = 1 if (section_bits >> i) & 1 else 0
 
         changed = False
@@ -676,9 +687,18 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
             else:
                 logger.debug("AgIO Hello ignored -- controller not ready")
 
-        elif pgn == 0xEF:  # Machine Data -- section bits
-            if len(data) > 12:
-                section_bits = data[11]
+        elif pgn == 0xE5:  # 229 -- 64-section state PGN (AGIO -> machine)
+            # 8 bytes, LSB-first within each byte: byte0 = sections 1..8,
+            # byte7 = sections 57..64.  Treated as a uint64 little-endian.
+            if len(data) >= 5 + 8:
+                section_bits = int.from_bytes(data[5:13], "little",
+                                              signed=False)
+                req.update_sections_from_aog(section_bits)
+
+        elif pgn == 0xEF:  # Machine Data -- section bits + signals
+            if len(data) > 11:
+                # Canonical AgIO PGN 0xEF: data[10] = SC1to8, data[11] = SC9to16
+                section_bits = data[10] | (data[11] << 8)
                 req.update_sections_from_aog(section_bits)
 
                 # Diagnostic: log AOG control bytes (tramline, hyd-lift,
@@ -754,7 +774,8 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                 spd = int.from_bytes(data[5:7], "little", signed=False) * 0.1
                 req.update_speed_from_aog(spd)
             if len(data) > 12:
-                section_bits = data[11]
+                # Canonical AgIO PGN 0xFE: data[11] = SC1to8, data[12] = SC9to16
+                section_bits = data[11] | (data[12] << 8)
                 req.update_sections_from_aog(section_bits)
 
 

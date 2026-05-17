@@ -9,8 +9,8 @@ controller UI mirrors reality.
 
 ## What it does
 
-- Listens on UDP port `8888` for AgOpenGPS PGNs (`0xC8` Hello, `0xEF`
-  Machine Data, `0xFE` Steer Data).
+- Listens on UDP port `8888` for AgOpenGPS PGNs (`0xC8` Hello, `0xE5`
+  64-section state, `0xEF` Machine Data, `0xFE` Steer Data).
 - Broadcasts feedback PGNs back (`0xEA` Section Data, `0xED` From
   Machine, Hello reply, switch-box PGN `32618`).
 - Talks a minimal TSIP-style framed serial protocol to the controller
@@ -84,7 +84,7 @@ subnet = 255.255.255.255
 |---|---|
 | `com` | Saved COM port (e.g. `COM7`). `0` = ask on startup. |
 | `comms_lost_zero` | On AgIO timeout, force all sections off and speed to zero. |
-| `sections` | Total sections sent in `SECTION_STATE_CMD`. Clamped to 1..16. |
+| `sections` | Total sections sent in `SECTION_STATE_CMD`. Clamped to 1..64. AOG addresses sections 1..16 via PGN 0xEF/0xFE (`SC1to8`+`SC9to16`) and the full 1..64 via PGN 0xE5 (8-byte 64-section PGN). All 64 are echoed back to AOG via the ISOBUS PGN 0xF0 path. |
 | `sct_hz` | `SECTION_STATE_CMD` send rate. |
 | `spd_hz` | `GPS_SPEED_CMD` send rate. |
 | `status_hz` | `STATUS_REQ` heartbeat / probe rate. |
@@ -92,9 +92,13 @@ subnet = 255.255.255.255
 
 ## Serial settings
 
-`38400` baud, 8-N-1, no flow control. Typically wired as a null-modem
+`38400` baud, 8-N-1, no flow control. Wire it as a null-modem
 (crossover) cable between the PC and the controller — see
-[nullmodemkabel.jpg](nullmodemkabel.jpg).
+[img/nullmodemkabel.jpg](img/nullmodemkabel.jpg).
+
+On a Väderstad Rapid the cable plugs into the port on the back of
+the in-cab control station — see
+[img/vaderstad_controlstation.jpeg](img/vaderstad_controlstation.jpeg).
 
 ## State machine
 
