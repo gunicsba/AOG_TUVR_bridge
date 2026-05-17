@@ -5,6 +5,7 @@ to a TUVR-speaking controller at 38400 8-N-1, and feeds the controller's
 section state back into AgIO so the rate controller UI mirrors reality.
 """
 import logging
+import logging.handlers
 import msvcrt
 import os
 import socket
@@ -59,11 +60,13 @@ AOG_MACHINE_SRC = 0x7B          # 123 = machine module
 #  Logging
 # ---------------------------------------------------------------------------
 LOG_LEVEL = logging.INFO
+LOG_FMT = "[%(asctime)s.%(msecs)03d] %(levelname)s %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
 
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="[%(asctime)s.%(msecs)03d] %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    format=LOG_FMT,
+    datefmt=LOG_DATEFMT,
 )
 logger = logging.getLogger("tuvr")
 
@@ -78,7 +81,15 @@ def get_app_directory() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-CONFIG_PATH = os.path.join(get_app_directory(), "config.ini")
+def _app_basename() -> str:
+    """Return the base name of the running exe/script (no extension)."""
+    if getattr(sys, "frozen", False):
+        return os.path.splitext(os.path.basename(sys.executable))[0]
+    return os.path.splitext(os.path.basename(__file__))[0]
+
+
+CONFIG_PATH = os.path.join(get_app_directory(), _app_basename() + ".ini")
+LOG_PATH = os.path.join(get_app_directory(), _app_basename() + ".log")
 
 
 def load_config() -> ConfigParser:
@@ -92,6 +103,10 @@ def load_config() -> ConfigParser:
             "spd_hz": str(DEFAULT_SPD_HZ),
             "status_hz": str(DEFAULT_STATUS_HZ),
             "subnet": "255.255.255.255",
+            # 0 = always tell AOG master=ON (default, current behaviour)
+            # 1 = mirror the controller's master-switch bit into SwitchPGN.main
+            #     so AOG only paints when the implement reports itself working
+            "use_implement_master": "0",
         }
         with open(CONFIG_PATH, "w") as f:
             config.write(f)
@@ -242,9 +257,18 @@ def select_port() -> Optional[str]:
 class TUVRRequester:
     def __init__(self, ser: serial.Serial, section_count: int,
                  sct_hz: int, spd_hz: int, status_hz: int,
+                 use_implement_master: bool,
                  config: ConfigParser) -> None:
         self.ser = ser
         self.config = config
+        self.use_implement_master = use_implement_master
+        # Last decoded controller master-switch bit; None until first STATUS_RESP
+        self.controller_master_on: Optional[bool] = None
+        # Last decoded physical-section-switch bits from STATUS_RESP (32-bit)
+        self.controller_phys_switches: int = 0
+        # Last AOG PGN 0xEF signal bytes (uturn, speed, hyd, tram, geo) for
+        # change-detection on diagnostic logging.
+        self.last_ef_signal: Optional[bytes] = None
         self.lock = threading.Lock()            # serial write lock
         self.sections_lock = threading.Lock()   # target_sections / speed
         self.running = True
@@ -411,7 +435,7 @@ class TUVRRequester:
             self.enter_ready("first valid frame")
 
         if function == FUNCTION.STATUS:
-            logger.debug(f"STATUS reply [{payload.hex()}]")
+            self._on_status(payload)
         elif function == FUNCTION.SECTION_STATE:
             self._on_section_state(payload)
         elif function == FUNCTION.GPS_SPEED:
@@ -419,6 +443,52 @@ class TUVRRequester:
         else:
             logger.info(
                 f"RX unhandled function 0x{function:02X} [{payload.hex()}]")
+
+    # ---- STATUS_RESP handler ----
+    def _on_status(self, payload: bytes) -> None:
+        """Decode the controller's master/physical-switch bits.
+
+        payload layout (after header/ID/SubID/PageID strip):
+          [0]   transaction id
+          [1]   boom equipment state (bit 0 = master switch ON)
+          [2-3] current operational mode bits
+          [4-7] physical section switch states (32-bit, LE)
+          [8-11] applied rate
+          [12-13] last error
+        """
+        if len(payload) < 8:
+            logger.debug(f"STATUS reply (short) [{payload.hex()}]")
+            return
+
+        boom = payload[1]
+        master_on = bool(boom & 0x01)
+        phys = int.from_bytes(payload[4:8], "little", signed=False)
+
+        if master_on != self.controller_master_on:
+            logger.info(
+                f"Controller master switch -> {'ON' if master_on else 'OFF'}")
+            self.controller_master_on = master_on
+            # Push an updated SwitchPGN so AOG sees the change immediately
+            # (only relevant when we're mirroring it).
+            if self.use_implement_master:
+                self._refresh_switch_pgn()
+
+        if phys != self.controller_phys_switches:
+            logger.info(
+                f"Controller physical section switches = 0x{phys:08X}")
+            self.controller_phys_switches = phys
+
+    def _refresh_switch_pgn(self) -> None:
+        """Rebuild SwitchPGN with the current relay bytes + master authority."""
+        main_on = True
+        if (self.use_implement_master
+                and self.controller_master_on is not None):
+            main_on = self.controller_master_on
+        new_sw_pgn = build_switch_pgn(
+            True, main_on, self.relay_lo, self.relay_hi)
+        if new_sw_pgn != self._last_sw_pgn:
+            self._last_sw_pgn = new_sw_pgn
+            self.switch_pgn_pending = new_sw_pgn
 
     # ---- SECTION_STATE handler ----
     def _on_section_state(self, payload: bytes) -> None:
@@ -457,11 +527,9 @@ class TUVRRequester:
         self.off_lo = off & 0xFF
         self.off_hi = (off >> 8) & 0xFF
 
-        # V1: always-auto, always-master-on feedback to AOG.
-        new_sw_pgn = build_switch_pgn(True, True, self.relay_lo, self.relay_hi)
-        if new_sw_pgn != self._last_sw_pgn:
-            self._last_sw_pgn = new_sw_pgn
-            self.switch_pgn_pending = new_sw_pgn
+        # Master-switch authority: hardcoded ON, or mirrored from controller
+        # if use_implement_master is enabled in the config.
+        self._refresh_switch_pgn()
 
 
 def _bits_to_str(bits: List[bool]) -> str:
@@ -548,21 +616,54 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                 section_bits = data[11]
                 req.update_sections_from_aog(section_bits)
 
+                # Diagnostic: log AOG control bytes (tramline, hyd-lift,
+                # uturn, geoStop) whenever they change.  Byte positions
+                # follow the canonical AgIO Machine Data PGN layout.
+                ef_signal = bytes(data[5:10])  # uturn, speed, hyd, tram, geo
+                if ef_signal != req.last_ef_signal:
+                    if (req.last_ef_signal is None
+                            or ef_signal[0] != req.last_ef_signal[0]):
+                        logger.info(f"AOG uTurn -> 0x{ef_signal[0]:02X}")
+                    if (req.last_ef_signal is None
+                            or ef_signal[2] != req.last_ef_signal[2]):
+                        hname = {0: "none", 1: "LOWER", 2: "RAISE"}.get(
+                            ef_signal[2], f"0x{ef_signal[2]:02X}")
+                        logger.info(f"AOG hyd-lift -> {hname}")
+                    if (req.last_ef_signal is None
+                            or ef_signal[3] != req.last_ef_signal[3]):
+                        tname = {0: "off", 1: "RIGHT",
+                                 2: "LEFT", 3: "BOTH"}.get(
+                            ef_signal[3], f"0x{ef_signal[3]:02X}")
+                        logger.info(f"AOG TRAMLINE -> {tname}")
+                    if (req.last_ef_signal is None
+                            or ef_signal[4] != req.last_ef_signal[4]):
+                        logger.info(
+                            f"AOG geoStop -> 0x{ef_signal[4]:02X}")
+                    req.last_ef_signal = ef_signal
+
                 if req.state == MachineState.RUNNING:
                     if req.is_auto_mode:
+                        # Auto mode: AOG drives sections.  Do NOT feed
+                        # back the controller's stale relay/off state --
+                        # that causes a race where AOG sees "off" before
+                        # the controller has confirmed "on" and immediately
+                        # reverts its own command.
                         ea_relay_lo, ea_relay_hi = 0, 0
+                        ea_off_lo, ea_off_hi = 0, 0
                     else:
                         ea_relay_lo = req.relay_lo
                         ea_relay_hi = req.relay_hi
+                        ea_off_lo = req.off_lo
+                        ea_off_hi = req.off_hi
                     sect_data = build_section_data(
                         req.main_sw_bits,
                         ea_relay_lo, ea_relay_hi,
-                        req.off_lo, req.off_hi)
+                        ea_off_lo, ea_off_hi)
                     sock.sendto(sect_data, broadcast)
                     req.main_sw_bits = 0
 
                     from_machine = build_from_machine(
-                        req.relay_lo, req.relay_hi)
+                        ea_relay_lo, ea_relay_hi)
                     sock.sendto(from_machine, broadcast)
 
                     sw_pgn = req.switch_pgn_pending
@@ -597,7 +698,19 @@ def keyboard_loop(req: TUVRRequester) -> None:
 #  Main
 # ===========================================================================
 
+def _setup_file_logging() -> None:
+    """Add a rotating file handler so logs survive console close."""
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=3,
+        encoding="utf-8")
+    handler.setLevel(LOG_LEVEL)
+    handler.setFormatter(logging.Formatter(LOG_FMT, datefmt=LOG_DATEFMT))
+    logger.addHandler(handler)
+    logger.info(f"Logging to file: {LOG_PATH}")
+
+
 def main() -> None:
+    _setup_file_logging()
     print("AOG-TUVR Bridge  (AgOpenGPS <-> TUVR VR controller)")
     print()
 
@@ -609,11 +722,14 @@ def main() -> None:
     sct_hz = config.getint("main", "sct_hz", fallback=DEFAULT_SCT_HZ)
     spd_hz = config.getint("main", "spd_hz", fallback=DEFAULT_SPD_HZ)
     status_hz = config.getint("main", "status_hz", fallback=DEFAULT_STATUS_HZ)
+    use_impl_master = config.getboolean(
+        "main", "use_implement_master", fallback=False)
     subnet = config.get("main", "subnet", fallback="255.255.255.255")
 
     print(f"Config: sections={section_count}  SCT={sct_hz}Hz  "
           f"SPD={spd_hz}Hz  STATUS={status_hz}Hz  "
-          f"comms_lost_zero={comms_lost_zero}  subnet={subnet}")
+          f"comms_lost_zero={comms_lost_zero}  "
+          f"use_implement_master={use_impl_master}  subnet={subnet}")
     print()
 
     available = {p.device for p in serial.tools.list_ports.comports()}
@@ -642,7 +758,7 @@ def main() -> None:
 
     parser = StreamParser()
     requester = TUVRRequester(ser, section_count, sct_hz, spd_hz,
-                              status_hz, config)
+                              status_hz, use_impl_master, config)
 
     threads = [
         threading.Thread(target=udp_listener_loop,
