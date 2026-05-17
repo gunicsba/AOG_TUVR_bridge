@@ -55,6 +55,7 @@ UDP_PORT = 8888
 UDP_TIMEOUT_S = 3
 AOG_PORT = 9999
 AOG_MACHINE_SRC = 0x7B          # 123 = machine module
+AOG_ISOBUS_SRC = 0x80           # 128 = ISOBUS / Task Controller source
 
 # ---------------------------------------------------------------------------
 #  Logging
@@ -107,6 +108,12 @@ def load_config() -> ConfigParser:
             # 1 = mirror the controller's master-switch bit into SwitchPGN.main
             #     so AOG only paints when the implement reports itself working
             "use_implement_master": "0",
+            # 1 = broadcast PGN 0xF0 every PGN 0xEF tick with the
+            #     controller-reported actual section state (default).
+            #     AOG uses this when the ISOBUS / Task Controller plugin
+            #     is enabled in AgIO; otherwise it is silently ignored.
+            # 0 = do not transmit the ISOBUS PGN 0xF0 feedback packet.
+            "send_isobus_feedback": "1",
         }
         with open(CONFIG_PATH, "w") as f:
             config.write(f)
@@ -188,6 +195,42 @@ def build_section_data(main_sw_bits: int, relay_lo: int, relay_hi: int,
     return bytes(msg)
 
 
+def build_isobus_section_feedback(enabled: bool, count: int,
+                                  bits: List[bool]) -> bytes:
+    """PGN 0xF0 -- ISOBUS Task Controller -> AOG actual section state.
+
+    Mirrors the AOG-TaskController format so AOG (with ISOBUS plugin
+    enabled in AgIO) treats this as the authoritative actual-state
+    feedback channel, independent of the Machine PGN 0xEA path.
+
+    Layout:
+      data[0]   = section control enabled flag (0/1)
+      data[1]   = number of sections (1..255)
+      data[2..] = packed section bits, 8 sections per byte, LSB-first
+                  (bit i of byte k -> section k*8 + i + 1)
+    """
+    n = max(1, min(255, count))
+    padded = list(bits)
+    if len(padded) < n:
+        padded += [False] * (n - len(padded))
+    padded = padded[:n]
+
+    payload = bytearray([1 if enabled else 0, n])
+    i = 0
+    while i < n:
+        b = 0
+        for k in range(8):
+            if i + k < n and padded[i + k]:
+                b |= (1 << k)
+        payload.append(b)
+        i += 8
+
+    msg = bytearray([0x80, 0x81, AOG_ISOBUS_SRC, 0xF0, len(payload)])
+    msg.extend(payload)
+    msg.append(aog_checksum(msg))
+    return bytes(msg)
+
+
 def _crc8(data: bytes, length: int) -> int:
     return sum(data[:length]) & 0xFF
 
@@ -258,12 +301,16 @@ class TUVRRequester:
     def __init__(self, ser: serial.Serial, section_count: int,
                  sct_hz: int, spd_hz: int, status_hz: int,
                  use_implement_master: bool,
+                 send_isobus_feedback: bool,
                  config: ConfigParser) -> None:
         self.ser = ser
         self.config = config
         self.use_implement_master = use_implement_master
+        self.send_isobus_feedback = send_isobus_feedback
         # Last decoded controller master-switch bit; None until first STATUS_RESP
         self.controller_master_on: Optional[bool] = None
+        # Last decoded operational-mode bitfield from STATUS_RESP (16-bit)
+        self.controller_opmode: Optional[int] = None
         # Last decoded physical-section-switch bits from STATUS_RESP (32-bit)
         self.controller_phys_switches: int = 0
         # Last AOG PGN 0xEF signal bytes (uturn, speed, hyd, tram, geo) for
@@ -462,6 +509,7 @@ class TUVRRequester:
 
         boom = payload[1]
         master_on = bool(boom & 0x01)
+        opmode = int.from_bytes(payload[2:4], "little", signed=False)
         phys = int.from_bytes(payload[4:8], "little", signed=False)
 
         if master_on != self.controller_master_on:
@@ -472,6 +520,23 @@ class TUVRRequester:
             # (only relevant when we're mirroring it).
             if self.use_implement_master:
                 self._refresh_switch_pgn()
+
+        if opmode != self.controller_opmode:
+            flags = []
+            if opmode & 0x0001:
+                flags.append("AUTO_RATE")
+            if opmode & 0x0002:
+                flags.append("AUTO_SECTION")
+            if opmode & 0x0004:
+                flags.append("MASTER_SW")
+            if opmode & 0x0008:
+                flags.append("AUX_VALVE")
+            if opmode & 0x0010:
+                flags.append("AUTOSTEER")
+            label = ",".join(flags) if flags else "-"
+            logger.info(
+                f"Controller op-mode -> 0x{opmode:04X} [{label}]")
+            self.controller_opmode = opmode
 
         if phys != self.controller_phys_switches:
             logger.info(
@@ -673,6 +738,17 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                         logger.info(
                             f"TX SwitchPGN -> {broadcast} [{sw_pgn.hex()}]")
 
+                    # Optional ISOBUS-style actual-state feedback (PGN 0xF0).
+                    # Sent every PGN 0xEF tick (~10 Hz) with the controller's
+                    # last-reported section state, matching the cadence used
+                    # by AOG-TaskController.
+                    if (req.send_isobus_feedback
+                            and req.machine_sections is not None):
+                        bits = [bool(s) for s in req.machine_sections]
+                        iso = build_isobus_section_feedback(
+                            True, req.section_count, bits)
+                        sock.sendto(iso, broadcast)
+
         elif pgn == 0xFE:  # Steer Data -- speed + section bits
             if len(data) > 6:
                 spd = int.from_bytes(data[5:7], "little", signed=False) * 0.1
@@ -724,12 +800,15 @@ def main() -> None:
     status_hz = config.getint("main", "status_hz", fallback=DEFAULT_STATUS_HZ)
     use_impl_master = config.getboolean(
         "main", "use_implement_master", fallback=False)
+    send_isobus = config.getboolean(
+        "main", "send_isobus_feedback", fallback=True)
     subnet = config.get("main", "subnet", fallback="255.255.255.255")
 
     print(f"Config: sections={section_count}  SCT={sct_hz}Hz  "
           f"SPD={spd_hz}Hz  STATUS={status_hz}Hz  "
           f"comms_lost_zero={comms_lost_zero}  "
-          f"use_implement_master={use_impl_master}  subnet={subnet}")
+          f"use_implement_master={use_impl_master}  "
+          f"send_isobus_feedback={send_isobus}  subnet={subnet}")
     print()
 
     available = {p.device for p in serial.tools.list_ports.comports()}
@@ -758,7 +837,8 @@ def main() -> None:
 
     parser = StreamParser()
     requester = TUVRRequester(ser, section_count, sct_hz, spd_hz,
-                              status_hz, use_impl_master, config)
+                              status_hz, use_impl_master,
+                              send_isobus, config)
 
     threads = [
         threading.Thread(target=udp_listener_loop,
