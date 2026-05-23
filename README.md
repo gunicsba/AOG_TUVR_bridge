@@ -1,6 +1,6 @@
 # AOG_TUVR_bridge
 
-AgOpenGPS <-> TUVR variable-rate controller bridge.
+AgOpenGPS <-> Quantron TUVR variable-rate controller bridge.
 
 Reads section and speed PGNs from AgIO over UDP, drives a binary serial
 link to a TUVR-speaking rate controller at 38400 8-N-1, and feeds the
@@ -12,16 +12,42 @@ controller UI mirrors reality.
 - Listens on UDP port `8888` for AgOpenGPS PGNs (`0xC8` Hello, `0xE5`
   64-section state, `0xEF` Machine Data, `0xFE` Steer Data).
 - Broadcasts feedback PGNs back (`0xEA` Section Data, `0xED` From
-  Machine, Hello reply, switch-box PGN `32618`).
+  Machine, Hello reply, switch-box PGN `32618`, `0xF0` ISOBUS Section
+  Control).
 - Talks a minimal TSIP-style framed serial protocol to the controller
-  with three wire messages:
+  with four wire messages:
   - `STATUS` (`0x00`) - heartbeat probe, sent at `status_hz`.
+  - `PROT_VERSION_CMD` (`0x80`) - startup handshake with Operational
+    Capability bitfield (enables external section control).
   - `SECTION_STATE` (`0x06`) - bit-packed section command out, echo
-    back in.
+    back in. Sent on-change only (not periodic).
   - `GPS_SPEED` (`0x81`) - speed in mm/s with a validity flag.
 - Also ships a loopback simulator
   ([tuvr_simulator.py](tuvr_simulator.py)) that pretends to be the
   controller on the other half of a com0com null-modem pair.
+
+## Section Control Flow
+
+**AOG → Bridge → Controller:**
+- AOG sends section state via **PGN 0xE5** (64-bit, authoritative) and
+  PGN 0xFE (Steer Data, 16-bit).
+- PGN 0xEF (Machine Data) section bytes are **NOT used** — they conflict
+  with PGN 0xE5 in current AgIO versions and cause rapid ON/OFF toggling.
+- Bridge sends `SECTION_STATE_CMD` to controller **only when section bits
+  actually change** (event-driven, not periodic).
+
+**Controller → Bridge → AOG:**
+- Controller reports actual section state in `STATUS_RESP` via
+  `machine_sections` (includes physical switch overrides).
+- Bridge feeds back to AOG via **PGN 0xF0** (ISOBUS Section Control) —
+  this is the primary feedback path AOG uses for section painting.
+- PGN 0xEA/0xED are also sent but serve as secondary feedback.
+- The ISOBUS SC button in AOG mirrors the **implement master switch**
+  state: when master is OFF, the button appears disabled; when master
+  turns ON, the button enables automatically.
+- When the implement master switch turns ON, the bridge re-sends AOG's
+  `target_sections` so the controller immediately knows the desired state
+  without requiring a manual toggle in AOG.
 
 ## Files
 
@@ -78,6 +104,9 @@ sct_hz = 5
 spd_hz = 5
 status_hz = 1
 subnet = 255.255.255.255
+
+[logging]
+level = INFO
 ```
 
 | Key | Meaning |
@@ -85,10 +114,11 @@ subnet = 255.255.255.255
 | `com` | Saved COM port (e.g. `COM7`). `0` = ask on startup. |
 | `comms_lost_zero` | On AgIO timeout, force all sections off and speed to zero. |
 | `sections` | Total sections sent in `SECTION_STATE_CMD`. Clamped to 1..64. AOG addresses sections 1..16 via PGN 0xEF/0xFE (`SC1to8`+`SC9to16`) and the full 1..64 via PGN 0xE5 (8-byte 64-section PGN). All 64 are echoed back to AOG via the ISOBUS PGN 0xF0 path. |
-| `sct_hz` | `SECTION_STATE_CMD` send rate. |
+| `sct_hz` | `SECTION_STATE_CMD` send rate (0 = on-change only). |
 | `spd_hz` | `GPS_SPEED_CMD` send rate. |
 | `status_hz` | `STATUS_REQ` heartbeat / probe rate. |
 | `subnet` | Broadcast address for AgIO PGNs. |
+| `level` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. `INFO` shows section changes, master switch, speed (throttled to 0.2 Hz), connection state. `DEBUG` adds packet-level detail. |
 
 ## Serial settings
 
@@ -106,9 +136,10 @@ the in-cab control station — see
   more than `MACHINE_TIMEOUT_S = 5 s` ago. `STATUS_REQ` still fires at
   `status_hz` as a probe.
 - **READY** - controller replied at least once and AgIO is not
-  connected yet.
+  connected yet. `PROT_VERSION_CMD` handshake is sent on first valid
+  frame to enable external section control.
 - **RUNNING** - READY plus AgIO is sending PGNs. `SECTION_STATE_CMD`
-  and `GPS_SPEED_CMD` are streamed at their configured rates.
+  (on-change) and `GPS_SPEED_CMD` (periodic) are streamed.
 
 Any incoming valid frame bumps DISCONNECTED -> READY. AgIO timeout
 drops RUNNING -> READY.
@@ -142,11 +173,12 @@ escaped by doubling any `0x10` to `0x10 0x10`; the stream parser
 collapses them back on receive. Checksum is a 16-bit unsigned sum of
 `0xAA + function + payload`, transmitted little-endian.
 
-Only three functions are used on the wire:
+Functions used on the wire:
 
 | Name | Value | Direction | Payload |
 |---|---|---|---|
 | `STATUS` | `0x00` | req out, reply in | 1-byte `txn_id` (we always send `0xFF`) |
+| `PROT_VERSION_CMD` | `0x80` | out (handshake) | Operational Capability bitfield (enables external section control) |
 | `SECTION_STATE` | `0x06` | both ways | empty = read, or `reserved + count(LE16) + bit-packed bits` |
 | `GPS_SPEED` | `0x81` | out | `uint32 mm/s (LE) + 1-byte source` |
 

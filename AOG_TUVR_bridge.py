@@ -27,6 +27,7 @@ from tuvr_protocol import (
     build_section_state_cmd,
     build_section_state_req,
     build_status_req,
+    build_prot_version_cmd,
     unpack_section_bits,
 )
 
@@ -39,7 +40,7 @@ DEFAULT_SECTION_COUNT = 8
 # ---------------------------------------------------------------------------
 #  Timing
 # ---------------------------------------------------------------------------
-DEFAULT_SCT_HZ = 5             # SECTION_STATE_CMD rate
+DEFAULT_SCT_HZ = 0             # SECTION_STATE_CMD: 0 = on-change only
 DEFAULT_SPD_HZ = 5             # GPS_SPEED_CMD rate
 DEFAULT_STATUS_HZ = 1          # STATUS_REQ rate
 
@@ -58,9 +59,34 @@ AOG_MACHINE_SRC = 0x7B          # 123 = machine module
 AOG_ISOBUS_SRC = 0x80           # 128 = ISOBUS / Task Controller source
 
 # ---------------------------------------------------------------------------
+#  Config
+# ---------------------------------------------------------------------------
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "config.ini")
+
+def read_config():
+    """Read config.ini, return dict of settings."""
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        import configparser
+        cp = configparser.ConfigParser()
+        cp.read(CONFIG_PATH)
+        if cp.has_section("logging"):
+            cfg["log_level"] = cp.get("logging", "level", fallback="INFO").upper()
+        if cp.has_section("serial"):
+            cfg["com_port"] = cp.get("serial", "port", fallback=None)
+            cfg["baud"] = cp.getint("serial", "baud", fallback=None)
+        if cp.has_section("network"):
+            cfg["udp_port"] = cp.getint("network", "port", fallback=None)
+            cfg["broadcast"] = cp.get("network", "broadcast", fallback=None)
+    return cfg
+
+# ---------------------------------------------------------------------------
 #  Logging
 # ---------------------------------------------------------------------------
-LOG_LEVEL = logging.INFO
+_config = read_config()
+LOG_LEVEL_NAME = _config.get("log_level", "DEBUG")
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.DEBUG)
 LOG_FMT = "[%(asctime)s.%(msecs)03d] %(levelname)s %(message)s"
 LOG_DATEFMT = "%H:%M:%S"
 
@@ -311,11 +337,24 @@ class TUVRRequester:
         self.controller_master_on: Optional[bool] = None
         # Last decoded operational-mode bitfield from STATUS_RESP (16-bit)
         self.controller_opmode: Optional[int] = None
-        # Last decoded physical-section-switch bits from STATUS_RESP (32-bit)
+        # Last decoded physical-section-switch bits from STATUS_RESP (32-bit).
         self.controller_phys_switches: int = 0
         # Last AOG PGN 0xEF signal bytes (uturn, speed, hyd, tram, geo) for
         # change-detection on diagnostic logging.
         self.last_ef_signal: Optional[bytes] = None
+        # ISOBUS Section Control enabled flag (from PGN 0xF0).  Tracked
+        # so the bridge can react to AOG's ISOBUS SC button -- today it
+        # just gets echoed back in the outgoing PGN 0xF0 feedback so the
+        # button does not appear stuck-on; reserved for future "auto
+        # section on/off" wiring if we need to gate SECTION_STATE_CMD on
+        # it.  Initialised to True to preserve the existing always-on
+        # default until AOG explicitly toggles it.
+        self.isobus_sc_enabled: Optional[bool] = True
+        # PROT_VERSION_CMD handshake: True after we have sent PROT_VER
+        # on the current controller link.  Reset to False on disconnect
+        # so we re-announce ourselves to the controller after every
+        # reconnect.
+        self.prot_version_sent: bool = False
         self.lock = threading.Lock()            # serial write lock
         self.sections_lock = threading.Lock()   # target_sections / speed
         self.running = True
@@ -334,6 +373,8 @@ class TUVRRequester:
         # Section state
         self.target_sections = [0] * self.section_count          # from AOG
         self.machine_sections: Optional[List[int]] = None         # last from controller
+        self._last_sent_section_bits: int = -1
+        self._last_speed_log: float = 0.0
 
         # Speed (km/h) from AOG
         self.current_speed_kmh = 0.0
@@ -352,7 +393,9 @@ class TUVRRequester:
         self.switch_pgn_pending: Optional[bytes] = None
         self._last_sw_pgn: Optional[bytes] = None
 
-        # Periodic timers
+        # Last AOG section bits (raw, before any masking). Used for
+        # change-detection so we only send SECTION_STATE_CMD when AOG
+        # actually changes its mind.
         self.sct_hz = max(1, sct_hz)
         self.spd_hz = max(1, spd_hz)
         self.status_hz = max(1, status_hz)
@@ -363,11 +406,11 @@ class TUVRRequester:
     # ------------------------------------------------------------------
     #  Serial write helpers
     # ------------------------------------------------------------------
-    def _send(self, packet: bytes, label: str) -> None:
+    def _send(self, packet: bytes, label: str, level: int = logging.INFO) -> None:
         with self.lock:
             self.ser.write(packet)
             self.ser.flush()
-        logger.info(f"TX >> {label} [{packet.hex()}]")
+        logger.log(level, f"TX >> {label} [{packet.hex()}]")
 
     # ------------------------------------------------------------------
     #  State transitions
@@ -377,11 +420,22 @@ class TUVRRequester:
             logger.info(f"STATE -> DISCONNECTED ({reason})")
         self.state = MachineState.DISCONNECTED
         self.machine_sections = None
+        # Re-announce ourselves with PROT_VERSION_CMD on next reconnect.
+        self.prot_version_sent = False
 
     def enter_ready(self, reason: str) -> None:
         if self.state != MachineState.READY:
             logger.info(f"STATE -> READY ({reason})")
         self.state = MachineState.READY
+        # Send the PROT_VERSION_CMD handshake exactly once per link, as
+        # soon as we know the controller is alive.  Without this packet
+        # the VR controller does not engage external section control --
+        # it acknowledges SECTION_STATE_CMD frames but ignores the
+        # commanded bits and keeps reflecting only its physical
+        # switches.  See TUVR spec section 5.2.12 (Operational
+        # Capability field).
+        if not self.prot_version_sent:
+            self.send_prot_version_cmd("link up")
 
     def enter_running(self, reason: str) -> None:
         if self.state != MachineState.RUNNING:
@@ -394,6 +448,15 @@ class TUVRRequester:
     # ------------------------------------------------------------------
     #  Periodic scheduler
     # ------------------------------------------------------------------
+    def send_prot_version_cmd(self, reason: str) -> None:
+        """Build & emit the PROT_VERSION_CMD handshake packet.
+
+        Payload is the hardcoded ``PROT_VER`` byte array defined in
+        :mod:`tuvr_protocol`; the bridge does not vary it at runtime.
+        """
+        self._send(build_prot_version_cmd(), f"PROT_VERSION_CMD ({reason})")
+        self.prot_version_sent = True
+
     def periodic_loop(self) -> None:
         while self.running:
             now = time.time()
@@ -417,18 +480,6 @@ class TUVRRequester:
 
             # --- RUNNING-only sends ---
             if self.state == MachineState.RUNNING:
-                if (now - self.last_sct_time) >= (1.0 / self.sct_hz):
-                    with self.sections_lock:
-                        bits = [bool(s) for s in self.target_sections]
-                    n = self.section_count
-                    if len(bits) < n:
-                        bits = bits + [False] * (n - len(bits))
-                    else:
-                        bits = bits[:n]
-                    self._send(build_section_state_cmd(bits),
-                               f"SECTION_STATE_CMD {_bits_to_str(bits)}")
-                    self.last_sct_time = now
-
                 if (now - self.last_spd_time) >= (1.0 / self.spd_hz):
                     with self.sections_lock:
                         spd_kmh = self.current_speed_kmh
@@ -438,7 +489,8 @@ class TUVRRequester:
                     self._send(
                         build_gps_speed_cmd(mm_per_s, source),
                         f"GPS_SPEED_CMD {spd_kmh:.1f}km/h "
-                        f"({mm_per_s}mm/s src={source})")
+                        f"({mm_per_s}mm/s src={source})",
+                        level=logging.DEBUG)
                     self.last_spd_time = now
 
             time.sleep(TICK_S)
@@ -453,6 +505,9 @@ class TUVRRequester:
         section ``i+1``.  Sources today:
           * PGN 0xEF / 0xFE -> 16-bit (SC1to8 + SC9to16)
           * PGN 0xE5       -> full 64-bit (8 bytes, LSB-first per byte)
+
+        SECTION_STATE_CMD is sent ONLY when the bits actually change,
+        not on a periodic timer.
         """
         new_sections = [0] * self.section_count
         for i in range(min(64, self.section_count)):
@@ -474,11 +529,46 @@ class TUVRRequester:
                 bits = bits[:n]
             self._send(build_section_state_cmd(bits),
                        f"SECTION_STATE_CMD (change) {_bits_to_str(bits)}")
+            self._last_sent_section_bits = section_bits
+
+        # In auto-mode, the AOG-facing relay/off masks reflect WHAT WE
+        # COMMANDED (target_sections) -- not the controller's transient
+        # actual state.  Otherwise AOG sees a one-round-trip flicker:
+        # cmd ON -> controller still OFF -> feedback OFF -> AOG flashes
+        # OFF -> cmd ON again -> ... ad infinitum.  See _on_section_state.
+        if changed and self.is_auto_mode:
+            self._apply_target_to_relays()
+
+    def _apply_target_to_relays(self) -> None:
+        """Refresh relay_lo/hi/off_lo/hi from target_sections.
+
+        Used in auto-mode so the AOG-facing SwitchPGN reports what was
+        commanded rather than the controller's lagging actual state.
+        """
+        with self.sections_lock:
+            target = list(self.target_sections)
+        relay = 0
+        off = 0
+        for i, on in enumerate(target):
+            if on:
+                relay |= (1 << i)
+            else:
+                off |= (1 << i)
+        self.relay_lo = relay & 0xFF
+        self.relay_hi = (relay >> 8) & 0xFF
+        self.off_lo = off & 0xFF
+        self.off_hi = (off >> 8) & 0xFF
+        self._refresh_switch_pgn()
 
     def update_speed_from_aog(self, speed_kmh: float) -> None:
         with self.sections_lock:
             self.current_speed_kmh = speed_kmh
             self.last_aog_speed_time = time.time()
+        # Log speed at 0.2 Hz (once every 5 seconds)
+        now = time.time()
+        if now - self._last_speed_log >= 5.0:
+            logger.info(f"AOG speed -> {speed_kmh:.1f} km/h")
+            self._last_speed_log = now
 
     # ------------------------------------------------------------------
     #  Incoming packet dispatch
@@ -531,6 +621,23 @@ class TUVRRequester:
             # (only relevant when we're mirroring it).
             if self.use_implement_master:
                 self._refresh_switch_pgn()
+            # When master switch turns ON, re-send what AOG commanded
+            # (target_sections) so the controller knows the desired state.
+            # When master turns OFF, no need to re-send (controller ignores
+            # commands anyway).
+            if master_on:
+                with self.sections_lock:
+                    target = list(self.target_sections)
+                bits = 0
+                for i, on in enumerate(target):
+                    if on:
+                        bits |= (1 << i)
+                self._last_sent_section_bits = bits
+                # Force re-send even if bits match last sent (master changed)
+                n = self.section_count
+                section_list = [bool(on) for on in target[:n]]
+                self._send(build_section_state_cmd(section_list),
+                           f"SECTION_STATE_CMD (master ON) {_bits_to_str(section_list)}")
 
         if opmode != self.controller_opmode:
             flags = []
@@ -553,6 +660,7 @@ class TUVRRequester:
             logger.info(
                 f"Controller physical section switches = 0x{phys:08X}")
             self.controller_phys_switches = phys
+            self._update_controller_section_mask()
 
     def _refresh_switch_pgn(self) -> None:
         """Rebuild SwitchPGN with the current relay bytes + master authority."""
@@ -565,6 +673,14 @@ class TUVRRequester:
         if new_sw_pgn != self._last_sw_pgn:
             self._last_sw_pgn = new_sw_pgn
             self.switch_pgn_pending = new_sw_pgn
+
+    def _update_controller_section_mask(self) -> None:
+        """No-op: kept for backwards compatibility; mask logic removed."""
+        pass
+
+    def _apply_controller_mask(self, section_bits: int) -> int:
+        """No-op: kept for backwards compatibility; mask logic removed."""
+        return section_bits
 
     # ---- SECTION_STATE handler ----
     def _on_section_state(self, payload: bytes) -> None:
@@ -586,26 +702,44 @@ class TUVRRequester:
         # Fit the bridge's configured section_count for AOG bitmask purposes.
         cur = [1 if (i < len(bits) and bits[i]) else 0
                for i in range(self.section_count)]
+        
+        # Diagnostic: log when controller sections differ from commanded.
+        if cur != self.target_sections:
+            logger.warning(
+                f"Controller sections MISMATCH: "
+                f"commanded={self.target_sections[:8]} "
+                f"actual={cur[:8]} "
+                f"phys_switches=0x{self.controller_phys_switches:08X} "
+                f"master={'ON' if self.controller_master_on else 'OFF' if self.controller_master_on is not None else 'UNKNOWN'}")
+        
         if cur != self.machine_sections:
             self.machine_sections = cur
             logger.info(f"Controller sections = {cur}")
 
         # Update relay/off masks for AgOpenGPS feedback PGNs.
-        relay = 0
-        off = 0
-        for i, on in enumerate(cur):
-            if on:
-                relay |= (1 << i)
-            else:
-                off |= (1 << i)
-        self.relay_lo = relay & 0xFF
-        self.relay_hi = (relay >> 8) & 0xFF
-        self.off_lo = off & 0xFF
-        self.off_hi = (off >> 8) & 0xFF
+        # In auto-mode AOG is the master and feeding back the
+        # controller's transient "actual" state would race with our
+        # commanded state -- AOG sees ON momentarily flip to OFF (one
+        # round-trip lag) and toggles its own UI.  The user perceives
+        # this as flashing sections.  In auto-mode the relay masks are
+        # driven from target_sections in _apply_target_to_relays();
+        # here we only refresh from the controller in non-auto modes.
+        if not self.is_auto_mode:
+            relay = 0
+            off = 0
+            for i, on in enumerate(cur):
+                if on:
+                    relay |= (1 << i)
+                else:
+                    off |= (1 << i)
+            self.relay_lo = relay & 0xFF
+            self.relay_hi = (relay >> 8) & 0xFF
+            self.off_lo = off & 0xFF
+            self.off_hi = (off >> 8) & 0xFF
 
-        # Master-switch authority: hardcoded ON, or mirrored from controller
-        # if use_implement_master is enabled in the config.
-        self._refresh_switch_pgn()
+            # Master-switch authority: hardcoded ON, or mirrored from
+            # controller if use_implement_master is enabled in config.
+            self._refresh_switch_pgn()
 
 
 def _bits_to_str(bits: List[bool]) -> str:
@@ -672,6 +806,7 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
             continue
 
         pgn = data[3]
+        logger.debug(f"RX UDP PGN 0x{pgn:02X} len={len(data)} [{data.hex()}]")
 
         if pgn == 0xC8:  # AgIO Hello
             if not req.agio_connected:
@@ -697,10 +832,6 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
 
         elif pgn == 0xEF:  # Machine Data -- section bits + signals
             if len(data) > 11:
-                # Canonical AgIO PGN 0xEF: data[10] = SC1to8, data[11] = SC9to16
-                section_bits = data[10] | (data[11] << 8)
-                req.update_sections_from_aog(section_bits)
-
                 # Diagnostic: log AOG control bytes (tramline, hyd-lift,
                 # uturn, geoStop) whenever they change.  Byte positions
                 # follow the canonical AgIO Machine Data PGN layout.
@@ -726,6 +857,12 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                             f"AOG geoStop -> 0x{ef_signal[4]:02X}")
                     req.last_ef_signal = ef_signal
 
+                # NOTE: PGN 0xEF section bytes (data[10:12]) are NOT used for
+                # section control -- AOG sends authoritative section state via
+                # PGN 0xE5 (64-bit).  PGN 0xEF's section bytes appear to be
+                # stale/unused in current AgIO versions and conflict with
+                # PGN 0xE5, causing rapid ON/OFF toggling.
+
                 if req.state == MachineState.RUNNING:
                     if req.is_auto_mode:
                         # Auto mode: AOG drives sections.  Do NOT feed
@@ -745,11 +882,17 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                         ea_relay_lo, ea_relay_hi,
                         ea_off_lo, ea_off_hi)
                     sock.sendto(sect_data, broadcast)
+                    logger.debug(
+                        f"TX PGN 0xEA -> {broadcast} [{sect_data.hex()}] "
+                        f"relay=0x{ea_relay_lo:02X}{ea_relay_hi:02X} "
+                        f"off=0x{ea_off_lo:02X}{ea_off_hi:02X}")
                     req.main_sw_bits = 0
 
                     from_machine = build_from_machine(
                         ea_relay_lo, ea_relay_hi)
                     sock.sendto(from_machine, broadcast)
+                    logger.debug(
+                        f"TX PGN 0xED -> {broadcast} [{from_machine.hex()}]")
 
                     sw_pgn = req.switch_pgn_pending
                     if sw_pgn is not None:
@@ -762,12 +905,32 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                     # Sent every PGN 0xEF tick (~10 Hz) with the controller's
                     # last-reported section state, matching the cadence used
                     # by AOG-TaskController.
+                    #
+                    # The 'enabled' flag mirrors the implement's master switch
+                    # state so AOG's ISOBUS SC button reflects whether the
+                    # implement is actually accepting section commands.
                     if (req.send_isobus_feedback
                             and req.machine_sections is not None):
                         bits = [bool(s) for s in req.machine_sections]
                         iso = build_isobus_section_feedback(
-                            True, req.section_count, bits)
+                            bool(req.controller_master_on), req.section_count, bits)
                         sock.sendto(iso, broadcast)
+
+        elif pgn == 0xF0:  # ISOBUS Task Controller section feedback
+            # data[5] = section control enabled (0/1) per AgIO layout
+            # (offset accounts for the 5-byte AOG header before payload).
+            # The flag is tracked for diagnostics and to drive the
+            # outgoing PGN 0xF0 feedback so AOG's ISOBUS SC button does
+            # not appear stuck-on -- reserved for "auto section on/off"
+            # use later.  PROT_VERSION_CMD itself is hardcoded and not
+            # re-sent on toggle.
+            if len(data) >= 7:
+                sc_enabled = bool(data[5])
+                if sc_enabled != req.isobus_sc_enabled:
+                    logger.info(
+                        f"AOG ISOBUS Section Control -> "
+                        f"{'ENABLED' if sc_enabled else 'DISABLED'}")
+                    req.isobus_sc_enabled = sc_enabled
 
         elif pgn == 0xFE:  # Steer Data -- speed + section bits
             if len(data) > 6:
@@ -780,7 +943,8 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
 
 
 def keyboard_loop(req: TUVRRequester) -> None:
-    logger.info("Keyboard: X = exit")
+    logger.info("Keyboard: X=exit  S=status  H=re-send handshake  "
+                "I=toggle ISOBUS SC  0=all-off  A=all-on  1=section1-only")
     while req.running:
         if msvcrt.kbhit():
             key = msvcrt.getch()
@@ -788,6 +952,48 @@ def keyboard_loop(req: TUVRRequester) -> None:
                 req.running = False
                 logger.info("Exit requested")
                 break
+            elif key in (b"s", b"S"):
+                opmode_str = (f"0x{req.controller_opmode:04X}"
+                              if req.controller_opmode is not None
+                              else "?")
+                machine_str = (str(req.machine_sections[:8])
+                               if req.machine_sections else "None")
+                logger.info(
+                    f"STATE={req.state.name}  "
+                    f"agio={req.agio_connected}  "
+                    f"target={req.target_sections[:8]}  "
+                    f"machine={machine_str}  "
+                    f"phys=0x{req.controller_phys_switches:08X}  "
+                    f"master={req.controller_master_on}  "
+                    f"opmode={opmode_str}  "
+                    f"isobus_sc={req.isobus_sc_enabled}  "
+                    f"prot_sent={req.prot_version_sent}")
+            elif key in (b"h", b"H"):
+                # Manual re-send of the startup handshake.  Useful when
+                # diagnosing whether the controller picks up our
+                # "external section control" claim.
+                req.send_prot_version_cmd("manual")
+            elif key in (b"i", b"I"):
+                # Manually flip the ISOBUS SC flag for testing without
+                # AOG.  Drives the same code path as AOG's button via
+                # PGN 0xF0; today this only changes the outgoing
+                # feedback echo, but it is reserved for an "auto section
+                # on/off" gate later.
+                new_state = not bool(req.isobus_sc_enabled)
+                logger.info(
+                    f"Manual test: ISOBUS SC -> "
+                    f"{'ENABLED' if new_state else 'DISABLED'}")
+                req.isobus_sc_enabled = new_state
+            elif key == b"0":
+                logger.info("Manual test: forcing all sections OFF")
+                req.update_sections_from_aog(0x0000)
+            elif key in (b"a", b"A"):
+                logger.info("Manual test: forcing all sections ON")
+                mask = (1 << req.section_count) - 1
+                req.update_sections_from_aog(mask)
+            elif key == b"1":
+                logger.info("Manual test: forcing only section 1 ON")
+                req.update_sections_from_aog(0x0001)
         time.sleep(0.05)
 
 
