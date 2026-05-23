@@ -16,10 +16,13 @@ parser collapses the doubled bytes back to a single 0x10 on receive.
 Checksum: unsigned 16-bit sum of (0xAA + function + payload),
 transmitted little-endian (lo byte first).
 
-Only three wire functions are used:
+Only four wire functions are used:
 
     STATUS         0x00   (heartbeat; payload = 1-byte txn_id, hardcoded 0xFF)
     SECTION_STATE  0x06   (request with empty payload, or bit-packed command)
+    PROT_VERSION   0x80   (one-shot startup handshake; declares display
+                          version + Operational Capability bits so the
+                          VR controller knows we want external section rate)
     GPS_SPEED      0x81   (uint32 mm/s + 1-byte source)
 """
 from __future__ import annotations
@@ -48,7 +51,21 @@ RESP_ID = 0x8F  # controller-to-display
 class FUNCTION(IntEnum):
     STATUS = 0x00
     SECTION_STATE = 0x06
+    PROT_VERSION = 0x80
     GPS_SPEED = 0x81
+
+
+# ---------------------------------------------------------------------------
+#  PROT_VERSION_CMD payload (10 bytes, hardcoded)
+# ---------------------------------------------------------------------------
+# Layout per TUVR spec section 5.2.12:
+#   bytes 0..7 : version
+#   bytes 8..9 : bit 1 = section control enabled  <-- WHAT WE NEED
+# ---------------------------------------------------------------------------
+PROT_VER = bytes([
+    0x01, 0x00, 0x00, 0x00,0x01, 0x04, 0x00, 0x00,
+    0x02, 0x00,               # Capability = 0x0002 (section control enabled)
+])
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +119,17 @@ def build_gps_speed_cmd(mm_per_s: int, source: int) -> bytes:
                           mm_per_s & 0xFFFFFFFF,
                           source & 0xFF)
     return build_packet(FUNCTION.GPS_SPEED, payload)
+
+
+def build_prot_version_cmd() -> bytes:
+    """PROT_VERSION_CMD - the startup handshake.
+
+    Sent ONCE to tell the VR controller which capabilities the display
+    (us, the bridge) wants to control externally.  Without this packet
+    the VR will not honor SECTION_STATE_CMD / TARGET_RATE_CMD /
+    BOOM_STATE_CMD.  Payload is the hardcoded :data:`PROT_VER`.
+    """
+    return build_packet(FUNCTION.PROT_VERSION, PROT_VER)
 
 
 # ---------------------------------------------------------------------------
