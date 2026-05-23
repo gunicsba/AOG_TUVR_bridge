@@ -59,47 +59,7 @@ AOG_MACHINE_SRC = 0x7B          # 123 = machine module
 AOG_ISOBUS_SRC = 0x80           # 128 = ISOBUS / Task Controller source
 
 # ---------------------------------------------------------------------------
-#  Config
-# ---------------------------------------------------------------------------
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "config.ini")
-
-def read_config():
-    """Read config.ini, return dict of settings."""
-    cfg = {}
-    if os.path.exists(CONFIG_PATH):
-        import configparser
-        cp = configparser.ConfigParser()
-        cp.read(CONFIG_PATH)
-        if cp.has_section("logging"):
-            cfg["log_level"] = cp.get("logging", "level", fallback="INFO").upper()
-        if cp.has_section("serial"):
-            cfg["com_port"] = cp.get("serial", "port", fallback=None)
-            cfg["baud"] = cp.getint("serial", "baud", fallback=None)
-        if cp.has_section("network"):
-            cfg["udp_port"] = cp.getint("network", "port", fallback=None)
-            cfg["broadcast"] = cp.get("network", "broadcast", fallback=None)
-    return cfg
-
-# ---------------------------------------------------------------------------
-#  Logging
-# ---------------------------------------------------------------------------
-_config = read_config()
-LOG_LEVEL_NAME = _config.get("log_level", "DEBUG")
-LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.DEBUG)
-LOG_FMT = "[%(asctime)s.%(msecs)03d] %(levelname)s %(message)s"
-LOG_DATEFMT = "%H:%M:%S"
-
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format=LOG_FMT,
-    datefmt=LOG_DATEFMT,
-)
-logger = logging.getLogger("tuvr")
-
-
-# ---------------------------------------------------------------------------
-#  Config
+#  Paths & Config
 # ---------------------------------------------------------------------------
 def get_app_directory() -> str:
     """Return the directory containing the script or frozen exe."""
@@ -115,13 +75,13 @@ def _app_basename() -> str:
     return os.path.splitext(os.path.basename(__file__))[0]
 
 
-CONFIG_PATH = os.path.join(get_app_directory(), _app_basename() + ".ini")
+INI_PATH = os.path.join(get_app_directory(), _app_basename() + ".ini")
 LOG_PATH = os.path.join(get_app_directory(), _app_basename() + ".log")
 
 
 def load_config() -> ConfigParser:
     config = ConfigParser()
-    if not os.path.exists(CONFIG_PATH):
+    if not os.path.exists(INI_PATH):
         config["main"] = {
             "com": "0",
             "comms_lost_zero": "1",
@@ -141,16 +101,65 @@ def load_config() -> ConfigParser:
             # 0 = do not transmit the ISOBUS PGN 0xF0 feedback packet.
             "send_isobus_feedback": "1",
         }
-        with open(CONFIG_PATH, "w") as f:
+        config["logging"] = {
+            # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+            # DEBUG = everything (very verbose)
+            # INFO = section changes, master switch, speed (throttled), connection state
+            # WARNING = only warnings and errors
+            "level": "INFO",
+        }
+        with open(INI_PATH, "w") as f:
             config.write(f)
     else:
-        config.read(CONFIG_PATH)
+        config.read(INI_PATH)
+        # Ensure [logging] section exists even in old INI files
+        if not config.has_section("logging"):
+            config["logging"] = {"level": "INFO"}
+            with open(INI_PATH, "w") as f:
+                config.write(f)
     return config
 
 
 def save_config(config: ConfigParser) -> None:
-    with open(CONFIG_PATH, "w") as f:
+    with open(INI_PATH, "w") as f:
         config.write(f)
+
+
+# ---------------------------------------------------------------------------
+#  Logging
+# ---------------------------------------------------------------------------
+# Define TRACE level (5) - below DEBUG (10)
+TRACE_LEVEL = 5
+logging.addLevelName(TRACE_LEVEL, "TRACE")
+
+
+def _setup_logging(config: ConfigParser) -> None:
+    """Configure logging from config [logging] section."""
+    log_level_name = config.get("logging", "level", fallback="INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    log_fmt = "[%(asctime)s.%(msecs)03d] %(levelname)s %(message)s"
+    log_datefmt = "%H:%M:%S"
+
+    # File handler (always DEBUG for troubleshooting)
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(log_fmt, datefmt=log_datefmt))
+
+    # Console handler (follows config level)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(logging.Formatter(log_fmt, datefmt=log_datefmt))
+
+    logger = logging.getLogger("tuvr")
+    logger.setLevel(logging.DEBUG)  # capture everything, handlers filter
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+
+# Load config FIRST so logging can read the level
+_config = load_config()
+_setup_logging(_config)
+logger = logging.getLogger("tuvr")
 
 
 # ===========================================================================
@@ -475,7 +484,7 @@ class TUVRRequester:
 
             # --- STATUS_REQ heartbeat (all states; acts as probe when DISCONNECTED) ---
             if (now - self.last_status_time) >= (1.0 / self.status_hz):
-                self._send(build_status_req(), "STATUS_REQ")
+                self._send(build_status_req(), "STATUS_REQ", level=logging.DEBUG)
                 self.last_status_time = now
 
             # --- RUNNING-only sends ---
@@ -760,7 +769,7 @@ def receiver_loop(ser: serial.Serial, parser: StreamParser,
                 continue
 
             for id_byte, function, payload in parser.feed(data):
-                logger.info(
+                logger.debug(
                     f"RX << id=0x{id_byte:02X} "
                     f"fn=0x{function:02X} [{payload.hex()}]")
                 req.handle_packet(id_byte, function, payload)
@@ -806,7 +815,7 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
             continue
 
         pgn = data[3]
-        logger.debug(f"RX UDP PGN 0x{pgn:02X} len={len(data)} [{data.hex()}]")
+        logger.log(TRACE_LEVEL, f"RX UDP PGN 0x{pgn:02X} len={len(data)} [{data.hex()}]")
 
         if pgn == 0xC8:  # AgIO Hello
             if not req.agio_connected:
@@ -898,7 +907,7 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
                     if sw_pgn is not None:
                         sock.sendto(sw_pgn, broadcast)
                         req.switch_pgn_pending = None
-                        logger.info(
+                        logger.debug(
                             f"TX SwitchPGN -> {broadcast} [{sw_pgn.hex()}]")
 
                     # Optional ISOBUS-style actual-state feedback (PGN 0xF0).
@@ -1001,23 +1010,12 @@ def keyboard_loop(req: TUVRRequester) -> None:
 #  Main
 # ===========================================================================
 
-def _setup_file_logging() -> None:
-    """Add a rotating file handler so logs survive console close."""
-    handler = logging.handlers.RotatingFileHandler(
-        LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=3,
-        encoding="utf-8")
-    handler.setLevel(LOG_LEVEL)
-    handler.setFormatter(logging.Formatter(LOG_FMT, datefmt=LOG_DATEFMT))
-    logger.addHandler(handler)
-    logger.info(f"Logging to file: {LOG_PATH}")
-
-
 def main() -> None:
-    _setup_file_logging()
+    config = load_config()
+    logger.info(f"Logging to file: {LOG_PATH}")
     print("AOG-TUVR Bridge  (AgOpenGPS <-> TUVR VR controller)")
     print()
 
-    config = load_config()
     saved_com = config.get("main", "com", fallback="0")
     comms_lost_zero = config.getboolean("main", "comms_lost_zero", fallback=True)
     section_count = config.getint("main", "sections",
