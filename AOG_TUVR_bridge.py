@@ -20,7 +20,9 @@ import serial
 import serial.tools.list_ports
 
 from tuvr_protocol import (
+    CMD_ID,
     FUNCTION,
+    RESP_ID,
     SECTION_COUNT_CHANGE,
     StreamParser,
     build_gps_speed_cmd,
@@ -364,6 +366,14 @@ class TUVRRequester:
         # so we re-announce ourselves to the controller after every
         # reconnect.
         self.prot_version_sent: bool = False
+        # Loopback/echo detection: every real controller reply should use
+        # id=0x8F (RESP_ID). id=0x8E (CMD_ID) on RX means we're seeing our
+        # own outbound bytes come back -- almost always a straight-through
+        # cable where a null-modem/crossover is required, or a wiring
+        # fault shorting TX to RX. Tracked so we can warn instead of
+        # silently mis-parsing echoed frames as real controller data.
+        self._cmd_id_echo_streak: int = 0
+        self._echo_warned: bool = False
         self.lock = threading.Lock()            # serial write lock
         self.sections_lock = threading.Lock()   # target_sections / speed
         self.running = True
@@ -507,7 +517,8 @@ class TUVRRequester:
     # ------------------------------------------------------------------
     #  Updates from AgOpenGPS
     # ------------------------------------------------------------------
-    def update_sections_from_aog(self, section_bits: int) -> None:
+    def update_sections_from_aog(self, section_bits: int,
+                                  force_send: bool = False) -> None:
         """Apply AOG-commanded section bits.
 
         ``section_bits`` is up to 64 bits wide; bit ``i`` corresponds to
@@ -517,6 +528,12 @@ class TUVRRequester:
 
         SECTION_STATE_CMD is sent ONLY when the bits actually change,
         not on a periodic timer.
+
+        ``force_send`` is set by the manual keyboard test keys (0/A/1)
+        so a bench test can push a SECTION_STATE_CMD without AgIO
+        connected. It still requires the controller link itself to be
+        alive (READY or RUNNING) -- it will not transmit while fully
+        DISCONNECTED, since there's nothing listening yet.
         """
         new_sections = [0] * self.section_count
         for i in range(min(64, self.section_count)):
@@ -528,8 +545,11 @@ class TUVRRequester:
                 changed = True
             self.target_sections = new_sections
 
+        can_send = (self.state == MachineState.RUNNING
+                    or (force_send and self.state != MachineState.DISCONNECTED))
+
         # Send immediately on change so the controller reacts without waiting.
-        if changed and self.state == MachineState.RUNNING:
+        if changed and can_send:
             n = self.section_count
             bits = [bool(s) for s in new_sections]
             if len(bits) < n:
@@ -539,6 +559,9 @@ class TUVRRequester:
             self._send(build_section_state_cmd(bits),
                        f"SECTION_STATE_CMD (change) {_bits_to_str(bits)}")
             self._last_sent_section_bits = section_bits
+        elif changed and not can_send:
+            logger.info(
+                f"Section change queued but not sent (state={self.state.name})")
 
         # In auto-mode, the AOG-facing relay/off masks reflect WHAT WE
         # COMMANDED (target_sections) -- not the controller's transient
@@ -586,6 +609,30 @@ class TUVRRequester:
                       payload: bytes) -> None:
         """Called by the receiver thread for every validated frame."""
         self.last_valid_machine_time = time.time()
+
+        # A real controller reply always uses RESP_ID (0x8F). Seeing
+        # CMD_ID (0x8E) on RX means the frame is our own TX being echoed
+        # straight back -- classic symptom of a straight-through cable
+        # where a null-modem/crossover is needed (or TX/RX shorted).
+        if id_byte == CMD_ID:
+            self._cmd_id_echo_streak += 1
+            if not self._echo_warned or self._cmd_id_echo_streak % 100 == 0:
+                logger.warning(
+                    f"RX frame has id=0x{id_byte:02X} (CMD_ID) -- this "
+                    f"looks like our own TX being echoed back, not a real "
+                    f"controller reply (real replies use id=0x{RESP_ID:02X}). "
+                    f"Check for a null-modem/crossover cable vs a "
+                    f"straight-through one, or TX/RX shorted. "
+                    f"({self._cmd_id_echo_streak} echoed frames so far)")
+                self._echo_warned = True
+        elif id_byte == RESP_ID:
+            if self._cmd_id_echo_streak:
+                logger.info(
+                    f"RX id=0x{RESP_ID:02X} (real controller reply) seen "
+                    f"after {self._cmd_id_echo_streak} echoed frames -- "
+                    f"link looks legitimate now.")
+            self._cmd_id_echo_streak = 0
+            self._echo_warned = False
 
         # First valid frame in any state brings us up to READY.
         if self.state == MachineState.DISCONNECTED:
@@ -995,14 +1042,14 @@ def keyboard_loop(req: TUVRRequester) -> None:
                 req.isobus_sc_enabled = new_state
             elif key == b"0":
                 logger.info("Manual test: forcing all sections OFF")
-                req.update_sections_from_aog(0x0000)
+                req.update_sections_from_aog(0x0000, force_send=True)
             elif key in (b"a", b"A"):
                 logger.info("Manual test: forcing all sections ON")
                 mask = (1 << req.section_count) - 1
-                req.update_sections_from_aog(mask)
+                req.update_sections_from_aog(mask, force_send=True)
             elif key == b"1":
                 logger.info("Manual test: forcing only section 1 ON")
-                req.update_sections_from_aog(0x0001)
+                req.update_sections_from_aog(0x0001, force_send=True)
         time.sleep(0.05)
 
 
