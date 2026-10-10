@@ -31,6 +31,10 @@ controller UI mirrors reality.
 **AOG → Bridge → Controller:**
 - AOG sends section state via **PGN 0xE5** (64-bit, authoritative) and
   PGN 0xFE (Steer Data, 16-bit).
+- PGN 0xFE section bits are used **only as a fallback** when no 0xE5 has
+  arrived for 2 s. AOG sends 0xFE before it recomputes sections, so it
+  always carries the previous frame's state; mixing it with 0xE5 made a
+  section blink back ON right after turning off (e.g. at the boundary).
 - PGN 0xEF (Machine Data) section bytes are **NOT used** — they conflict
   with PGN 0xE5 in current AgIO versions and cause rapid ON/OFF toggling.
 - Bridge sends `SECTION_STATE_CMD` to controller **only when section bits

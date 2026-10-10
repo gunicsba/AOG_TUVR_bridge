@@ -57,6 +57,11 @@ UDP_TIMEOUT_S = 3
 AOG_PORT = 9999
 AOG_MACHINE_SRC = 0x7B          # 123 = machine module
 AOG_ISOBUS_SRC = 0x80           # 128 = ISOBUS / Task Controller source
+# PGN 0xFE section bits are only used as a fallback when no PGN 0xE5 has
+# arrived within this window.  AOG sends 0xFE *before* it recomputes the
+# sections each frame, so 0xFE always carries the previous frame's state;
+# mixing both sources lets a stale ON slip in right after a turn-off.
+E5_AUTHORITY_WINDOW_S = 2.0
 
 # ---------------------------------------------------------------------------
 #  Paths & Config
@@ -366,6 +371,11 @@ class TUVRRequester:
         self.prot_version_sent: bool = False
         self.lock = threading.Lock()            # serial write lock
         self.sections_lock = threading.Lock()   # target_sections / speed
+        # Serialises "read target + send SECTION_STATE_CMD" so a resend from
+        # the receiver thread can never overtake a newer command from UDP.
+        self.section_cmd_lock = threading.Lock()
+        # time.time() of the last PGN 0xE5; 0.0 = never seen.
+        self.last_e5_time = 0.0
         self.running = True
 
         # Connection state
@@ -523,22 +533,18 @@ class TUVRRequester:
             new_sections[i] = 1 if (section_bits >> i) & 1 else 0
 
         changed = False
-        with self.sections_lock:
-            if new_sections != self.target_sections:
-                changed = True
-            self.target_sections = new_sections
+        with self.section_cmd_lock:
+            with self.sections_lock:
+                if new_sections != self.target_sections:
+                    changed = True
+                self.target_sections = new_sections
 
-        # Send immediately on change so the controller reacts without waiting.
-        if changed and self.state == MachineState.RUNNING:
-            n = self.section_count
-            bits = [bool(s) for s in new_sections]
-            if len(bits) < n:
-                bits = bits + [False] * (n - len(bits))
-            else:
-                bits = bits[:n]
-            self._send(build_section_state_cmd(bits),
-                       f"SECTION_STATE_CMD (change) {_bits_to_str(bits)}")
-            self._last_sent_section_bits = section_bits
+            # Send immediately on change so the controller reacts without waiting.
+            if changed and self.state == MachineState.RUNNING:
+                bits = [bool(s) for s in new_sections]
+                self._send(build_section_state_cmd(bits),
+                           f"SECTION_STATE_CMD (change) {_bits_to_str(bits)}")
+                self._last_sent_section_bits = section_bits
 
         # In auto-mode, the AOG-facing relay/off masks reflect WHAT WE
         # COMMANDED (target_sections) -- not the controller's transient
@@ -635,18 +641,18 @@ class TUVRRequester:
             # When master turns OFF, no need to re-send (controller ignores
             # commands anyway).
             if master_on:
-                with self.sections_lock:
-                    target = list(self.target_sections)
-                bits = 0
-                for i, on in enumerate(target):
-                    if on:
-                        bits |= (1 << i)
-                self._last_sent_section_bits = bits
-                # Force re-send even if bits match last sent (master changed)
-                n = self.section_count
-                section_list = [bool(on) for on in target[:n]]
-                self._send(build_section_state_cmd(section_list),
-                           f"SECTION_STATE_CMD (master ON) {_bits_to_str(section_list)}")
+                with self.section_cmd_lock:
+                    with self.sections_lock:
+                        target = list(self.target_sections)
+                    bits = 0
+                    for i, on in enumerate(target):
+                        if on:
+                            bits |= (1 << i)
+                    self._last_sent_section_bits = bits
+                    # Force re-send even if bits match last sent (master changed)
+                    section_list = [bool(on) for on in target]
+                    self._send(build_section_state_cmd(section_list),
+                               f"SECTION_STATE_CMD (master ON) {_bits_to_str(section_list)}")
 
         if opmode != self.controller_opmode:
             flags = []
@@ -837,6 +843,7 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
             if len(data) >= 5 + 8:
                 section_bits = int.from_bytes(data[5:13], "little",
                                               signed=False)
+                req.last_e5_time = time.time()
                 req.update_sections_from_aog(section_bits)
 
         elif pgn == 0xEF:  # Machine Data -- section bits + signals
@@ -945,7 +952,11 @@ def udp_listener_loop(req: TUVRRequester, comms_lost_zero: bool,
             if len(data) > 6:
                 spd = int.from_bytes(data[5:7], "little", signed=False) * 0.1
                 req.update_speed_from_aog(spd)
-            if len(data) > 12:
+            # Section bits only as a fallback: 0xFE is sent before AOG's
+            # section pass, so it lags 0xE5 by one frame (see
+            # E5_AUTHORITY_WINDOW_S).
+            if (len(data) > 12 and time.time() - req.last_e5_time
+                    > E5_AUTHORITY_WINDOW_S):
                 # Canonical AgIO PGN 0xFE: data[11] = SC1to8, data[12] = SC9to16
                 section_bits = data[11] | (data[12] << 8)
                 req.update_sections_from_aog(section_bits)
